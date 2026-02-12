@@ -177,13 +177,13 @@ if region is not None:
             st.info(f"Genotypes not loaded. Click below to fetch data for {n_samples:,} samples.")
             if st.button("Load genotypes", type="primary"):
                 start = time.time()
-                
+
                 with st.spinner(f"Fetching genotypes for {n_samples:,} samples... (this may take a few minutes)"):
                     region = load_genotypes(region)
                     st.session_state.region_with_gt = region
                 
                 st.success(f"Loaded in {time.time() - start:.1f}s")
-                st.rerun()
+                
         else:
             region = st.session_state.region_with_gt
             
