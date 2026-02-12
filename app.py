@@ -135,6 +135,24 @@ def get_all_sample_alleles(region):
     
     return df1, df2
 
+def get_haplotype_counts(region):
+    """Get haplotype distribution across all samples"""
+    allele_1_df, allele_2_df = get_all_sample_alleles(region)
+    
+    # Build haplotype string per sample: "A-T-G" (one allele per position)
+    haplotype_1 = allele_1_df.apply(lambda col: "-".join(col), axis=0)
+    haplotype_2 = allele_2_df.apply(lambda col: "-".join(col), axis=0)
+    
+    # Combine both haplotypes (each sample contributes 2 haplotypes)
+    all_haplotypes = pd.concat([haplotype_1, haplotype_2])
+    
+    # Count frequencies
+    counts = all_haplotypes.value_counts().reset_index()
+    counts.columns = ['haplotype', 'count']
+    counts['frequency'] = counts['count'] / len(all_haplotypes)
+    
+    return counts
+
 # Load data
 variant_data = load_full_variant_data()
 chunk_df = zarr_chunk_metadata()
@@ -169,29 +187,28 @@ if region is not None:
         st.divider()
         st.subheader("Sample Genotypes")
         
-        # Load genotypes button
+        # Initialize session state
         if 'region_with_gt' not in st.session_state:
             st.session_state.region_with_gt = None
+        if 'sample_idx' not in st.session_state:
+            st.session_state.sample_idx = 0
         
-        if st.session_state.region_with_gt is None:
+        # Check if genotypes are loaded
+        genotypes_loaded = st.session_state.region_with_gt is not None
+        
+        if not genotypes_loaded:
             st.info(f"Genotypes not loaded. Click below to fetch data for {n_samples:,} samples.")
             if st.button("Load genotypes", type="primary"):
                 start = time.time()
-                
                 with st.spinner(f"Fetching genotypes for {n_samples:,} samples..."):
                     region = load_genotypes(region)
                     st.session_state.region_with_gt = region
-                
-                st.toast(f"Loaded in {time.time() - start:.1f}s")
-                st.rerun()
-        else:
+                    genotypes_loaded = True
+                st.toast(f"✅ Loaded in {time.time() - start:.1f}s")
+        
+        if genotypes_loaded:
             region = st.session_state.region_with_gt
-            
-            # Sample selector
             sample_ids = region.attrs['_sample_ids']
-            
-            if 'sample_idx' not in st.session_state:
-                st.session_state.sample_idx = 0
             
             selected_sample = st.selectbox(
                 "Select sample:",
@@ -208,27 +225,28 @@ if region is not None:
             st.dataframe(gt_df, width="stretch", hide_index=True)
             st.caption(f"⏱️ Single sample: {time.time() - start:.3f}s")
             
-            # Load all samples button
+            # Haplotype distribution
             st.divider()
-            st.subheader("All Samples")
+            st.subheader("Haplotype Distribution")
             
-            if st.button("Show all samples"):
+            if st.button("Show haplotype counts"):
                 start = time.time()
-                allele_1_df, allele_2_df = get_all_sample_alleles(region)
+                with st.spinner("Computing haplotype frequencies..."):
+                    haplotype_df = get_haplotype_counts(region)
+                    st.session_state.haplotype_df = haplotype_df
+                st.toast(f"✅ Computed in {time.time() - start:.2f}s")
+            
+            if 'haplotype_df' in st.session_state:
+                haplotype_df = st.session_state.haplotype_df
                 
-                st.caption(f"⏱️ All samples: {time.time() - start:.3f}s")
-                st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
-
-                # Concatenate alleles into genotypes like "A/T"
-                genotypes_df = allele_1_df + "/" + allele_2_df
-
-                # Value counts per position (row)
-                counts_per_position = genotypes_df.apply(lambda row: row.value_counts().to_dict(), axis=1)
-                st.dataframe(pd.DataFrame(counts_per_position.tolist(), index=genotypes_df.index))
-
-                # Or total counts across all positions
-                total_counts = genotypes_df.values.flatten()
-                st.dataframe(pd.Series(total_counts).value_counts(), width="stretch")
+                st.write(f"**{len(haplotype_df)}** unique haplotypes from **{n_samples * 2:,}** chromosomes")
+                
+                # Show top haplotypes
+                st.dataframe(
+                    haplotype_df.head(100).style.format({'frequency': '{:.2%}'}),
+                    width="stretch",
+                    hide_index=True
+                )
 
 else:
     st.warning("No variants found in this region")
