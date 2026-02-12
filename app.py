@@ -1,7 +1,9 @@
 import malariagen_data
 import streamlit as st
 import pandas as pd
+import numpy as np
 import xarray as xr
+import time
 
 @st.cache_data
 def load_full_variant_data():
@@ -32,16 +34,13 @@ def load_chunk(chunk_df, chunk_id, variant_data):
     return variant_data.isel(variants=slice(int(row['slice_start']), int(row['slice_end'])))
 
 def query_region(chunk_df, chrom, start_pos, end_pos, variant_data):
-    """Load only the chunks needed for a region and filter to exact positions"""
+    """Load region and precompute all data eagerly"""
     matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
     
     if len(matching_chunks) == 0:
         return None
     
-    # Get unique chunk IDs
     chunk_ids = matching_chunks['chunk'].unique()
-    
-    # Load and combine chunks
     chunk_datasets = [load_chunk(chunk_df, cid, variant_data) for cid in chunk_ids]
     
     if len(chunk_datasets) == 1:
@@ -49,50 +48,171 @@ def query_region(chunk_df, chrom, start_pos, end_pos, variant_data):
     else:
         region_data = xr.concat(chunk_datasets, dim='variants')
     
-    # Filter to exact chromosome and position range
     mask = (
         (region_data["variant_chrom"].values == chrom) &
         (region_data["variant_position"].values >= start_pos) &
         (region_data["variant_position"].values <= end_pos)
     )
     
-    return region_data.isel(variants=mask)
+    result = region_data.isel(variants=mask)
+    
+    # Preload ALL data eagerly - single network cost
+    result.attrs['_positions'] = result["variant_position"].values
+    alleles = result["variant_allele"].values
+    if alleles.dtype.kind == 'S':
+        alleles = alleles.astype('U1')
+    result.attrs['_alleles'] = alleles
+    result.attrs['_genotypes'] = result["call_genotype"].values.astype(np.int8)
+    result.attrs['_sample_ids'] = result["sample_id"].values
+    
+    return result
+
+def get_sample_genotypes(region, sample_idx):
+    """Get genotypes for a single sample - uses cached data"""
+    positions = region.attrs['_positions']
+    alleles = region.attrs['_alleles']
+    genotypes = region.attrs['_genotypes'][:, sample_idx, :]
+    
+    n_variants = len(positions)
+    gt1 = genotypes[:, 0]
+    gt2 = genotypes[:, 1]
+    
+    row_idx = np.arange(n_variants)
+    valid1 = gt1 >= 0
+    valid2 = gt2 >= 0
+    
+    allele_1 = np.full(n_variants, '.', dtype='U1')
+    allele_2 = np.full(n_variants, '.', dtype='U1')
+    
+    allele_1[valid1] = alleles[row_idx[valid1], gt1[valid1]]
+    allele_2[valid2] = alleles[row_idx[valid2], gt2[valid2]]
+    
+    genotype = f"{gt1[0]}/{gt2[0]}"
+    
+    return pd.DataFrame({
+        'position': positions,
+        'genotype': genotype,
+        'allele_1': allele_1,
+        'allele_2': allele_2,
+    })
+
+def get_all_sample_alleles(region):
+    """Return allele calls as two separate DataFrames - optimized"""
+    positions = region.attrs['_positions']
+    alleles = region.attrs['_alleles']
+    sample_ids = region.attrs['_sample_ids']
+    genotypes = region.attrs['_genotypes']
+    
+    n_variants, n_samples, _ = genotypes.shape
+    
+    gt1 = genotypes[:, :, 0]
+    gt2 = genotypes[:, :, 1]
+    
+    # Vectorized allele lookup
+    row_idx = np.arange(n_variants)[:, np.newaxis]
+    
+    # Use bytes for speed
+    alleles_bytes = alleles.astype('S1') if alleles.dtype.kind == 'U' else alleles
+    
+    # Lookup alleles (handles missing with clip, then mask)
+    gt1_clipped = np.clip(gt1, 0, alleles.shape[1] - 1)
+    gt2_clipped = np.clip(gt2, 0, alleles.shape[1] - 1)
+    
+    allele_1 = alleles_bytes[row_idx, gt1_clipped]
+    allele_2 = alleles_bytes[row_idx, gt2_clipped]
+    
+    # Mask missing values
+    allele_1 = np.where(gt1 >= 0, allele_1, b'.')
+    allele_2 = np.where(gt2 >= 0, allele_2, b'.')
+    
+    # Convert to unicode at the end
+    df1 = pd.DataFrame(allele_1.astype('U1'), index=positions, columns=sample_ids)
+    df2 = pd.DataFrame(allele_2.astype('U1'), index=positions, columns=sample_ids)
+    
+    df1.index.name = 'position'
+    df2.index.name = 'position'
+    
+    return df1, df2
 
 # Load data
 variant_data = load_full_variant_data()
 chunk_df = zarr_chunk_metadata()
 
 # User input
-user_input = st.text_input("Insert region:", value="Pf3D7_07_v3:401,000-401,100")
+user_input = st.text_input("Query region:", value="Pf3D7_07_v3:401,000-401,100")
 chrom, start_pos, end_pos = extract_locus(user_input)
 
-# Find matching chunks
+# Query region (this now does all the heavy lifting)
+start = time.time()
 matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
-
-# Query region
 region = query_region(chunk_df, chrom, start_pos, end_pos, variant_data)
+query_time = time.time() - start
 
 # Display results
 st.header("Results")
 
 if region is not None:
     n_variants = region.dims['variants']
-    st.write(f"Found **{n_variants}** variants in `{chrom}:{start_pos:,}-{end_pos:,}`")
+    n_samples = region.dims['samples']
+    st.write(f"Found **{n_variants}** variants.")
+    st.caption(f"⏱️ Region loaded in {query_time:.2f}s")
     
-    # Show variant summary
     if n_variants > 0:
-        positions = region["variant_position"].values
-        st.write(f"Position range: {positions.min():,} - {positions.max():,}")
-        
-        # Show as dataframe
+        # Variant info table
         variant_df = pd.DataFrame({
-            'position': region["variant_position"].values,
+            'position': region.attrs['_positions'],
             'is_snp': region["variant_is_snp"].values,
             'filter_pass': region["variant_filter_pass"].values,
             'CDS': region["variant_CDS"].values,
             'numalt': region["variant_numalt"].values,
         })
-        st.dataframe(variant_df)
+        st.dataframe(variant_df, width="stretch", hide_index=True)
+        
+        st.divider()
+        st.subheader("Sample Genotypes")
+        
+        # Sample selector
+        sample_ids = region.attrs['_sample_ids']
+        
+        # Initialize session state
+        if 'sample_idx' not in st.session_state:
+            st.session_state.sample_idx = 0
+        
+        selected_sample = st.selectbox(
+            "Select sample:",
+            options=range(n_samples),
+            format_func=lambda i: f"{i+1}/{n_samples}: {sample_ids[i]}",
+            index=st.session_state.sample_idx,
+            key="sample_select"
+        )
+        st.session_state.sample_idx = selected_sample
+        
+        # Display genotypes for selected sample
+        sample_idx = st.session_state.sample_idx
+        
+        start = time.time()
+        gt_df = get_sample_genotypes(region, sample_idx)
+        st.dataframe(gt_df, width="stretch", hide_index=True)
+        st.caption(f"⏱️ Single sample: {time.time() - start:.3f}s")
+        
+        # Load all samples button
+        st.divider()
+        st.subheader("All Samples")
+        
+        if st.button("Load all samples"):
+            start = time.time()
+            allele_1_df, allele_2_df = get_all_sample_alleles(region)
+            
+            st.caption(f"⏱️ All samples: {time.time() - start:.0f}s")
+            
+            st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
+            
+            st.write("**Allele 1**")
+            st.dataframe(allele_1_df, width="stretch", hide_index=True)
+            
+            st.write("**Allele 2**")
+            st.dataframe(allele_2_df, width="stretch", hide_index=True)
+
 else:
     st.warning("No variants found in this region")
 
@@ -103,11 +223,10 @@ with st.expander("See inner workings"):
     st.text(f"Start: {start_pos:,}")
     st.text(f"End: {end_pos:,}")
     st.divider()
-
+    
     st.write("Matching chunks:")
     st.dataframe(matching_chunks)
     st.divider()
-
+    
     st.write("Full chunk metadata:")
     st.dataframe(chunk_df)
-    st.divider()
