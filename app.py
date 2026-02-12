@@ -28,20 +28,20 @@ def find_chunks_for_region(chunk_df, chrom, start_pos, end_pos):
         (chunk_df['min_pos'] <= end_pos)
     ]
 
-def load_chunk(chunk_df, chunk_id, variant_data):
-    """Load a single chunk as an xarray Dataset"""
-    row = chunk_df[chunk_df['chunk'] == chunk_id].iloc[0]
-    return variant_data.isel(variants=slice(int(row['slice_start']), int(row['slice_end'])))
-
-def query_region_lazy(chunk_df, chrom, start_pos, end_pos, variant_data):
-    """Load region metadata only (fast) - no genotypes"""
-    matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
+@st.cache_data
+def query_region_metadata(_variant_data, _chunk_df, chrom, start_pos, end_pos):
+    """Load region metadata only (cached)"""
+    matching_chunks = find_chunks_for_region(_chunk_df, chrom, start_pos, end_pos)
     
     if len(matching_chunks) == 0:
-        return None
+        return None, matching_chunks
     
     chunk_ids = matching_chunks['chunk'].unique()
-    chunk_datasets = [load_chunk(chunk_df, cid, variant_data) for cid in chunk_ids]
+    
+    chunk_datasets = []
+    for cid in chunk_ids:
+        row = _chunk_df[_chunk_df['chunk'] == cid].iloc[0]
+        chunk_datasets.append(_variant_data.isel(variants=slice(int(row['slice_start']), int(row['slice_end']))))
     
     if len(chunk_datasets) == 1:
         region_data = chunk_datasets[0]
@@ -56,32 +56,43 @@ def query_region_lazy(chunk_df, chrom, start_pos, end_pos, variant_data):
     
     result = region_data.isel(variants=mask)
     
-    # Preload only lightweight metadata
-    result.attrs['_positions'] = result["variant_position"].values
+    # Return serializable metadata dict
+    positions = result["variant_position"].values
     alleles = result["variant_allele"].values
     if alleles.dtype.kind == 'S':
         alleles = alleles.astype('U1')
-    result.attrs['_alleles'] = alleles
-    result.attrs['_sample_ids'] = result["sample_id"].values
-    result.attrs['_genotypes_loaded'] = False
     
-    return result
+    region_meta = {
+        'positions': positions,
+        'alleles': alleles,
+        'sample_ids': result["sample_id"].values,
+        'is_snp': result["variant_is_snp"].values,
+        'filter_pass': result["variant_filter_pass"].values,
+        'CDS': result["variant_CDS"].values,
+        'numalt': result["variant_numalt"].values,
+        'n_variants': result.dims['variants'],
+        'n_samples': result.dims['samples'],
+    }
+    
+    # Store region reference in session state for genotype loading
+    st.session_state._region_xr = result
+    
+    return region_meta, matching_chunks
 
-def load_genotypes(region):
-    """Load genotypes into region (slow network call)"""
-    region.attrs['_genotypes'] = region["call_genotype"].values.astype(np.int8)
-    region.attrs['_genotypes_loaded'] = True
-    return region
+def load_genotypes():
+    """Load genotypes from cached xarray region"""
+    region = st.session_state._region_xr
+    return region["call_genotype"].values.astype(np.int8)
 
-def get_sample_genotypes(region, sample_idx):
-    """Get genotypes for a single sample - uses cached data"""
-    positions = region.attrs['_positions']
-    alleles = region.attrs['_alleles']
-    genotypes = region.attrs['_genotypes'][:, sample_idx, :]
+def get_sample_genotypes(region_meta, genotypes, sample_idx):
+    """Get genotypes for a single sample"""
+    positions = region_meta['positions']
+    alleles = region_meta['alleles']
+    gt = genotypes[:, sample_idx, :]
     
     n_variants = len(positions)
-    gt1 = genotypes[:, 0]
-    gt2 = genotypes[:, 1]
+    gt1 = gt[:, 0]
+    gt2 = gt[:, 1]
     
     row_idx = np.arange(n_variants)
     valid1 = gt1 >= 0
@@ -93,21 +104,16 @@ def get_sample_genotypes(region, sample_idx):
     allele_1[valid1] = alleles[row_idx[valid1], gt1[valid1]]
     allele_2[valid2] = alleles[row_idx[valid2], gt2[valid2]]
     
-    genotype = f"{gt1[0]}/{gt2[0]}"
-    
     return pd.DataFrame({
         'position': positions,
-        'genotype': genotype,
         'allele_1': allele_1,
         'allele_2': allele_2,
     })
 
-def get_all_sample_alleles(region):
-    """Return allele calls as two separate DataFrames - optimized"""
-    positions = region.attrs['_positions']
-    alleles = region.attrs['_alleles']
-    sample_ids = region.attrs['_sample_ids']
-    genotypes = region.attrs['_genotypes']
+def get_haplotype_counts(region_meta, genotypes):
+    """Get haplotype distribution across all samples"""
+    positions = region_meta['positions']
+    alleles = region_meta['alleles']
     
     n_variants, n_samples, _ = genotypes.shape
     
@@ -127,27 +133,16 @@ def get_all_sample_alleles(region):
     allele_1 = np.where(gt1 >= 0, allele_1, b'.')
     allele_2 = np.where(gt2 >= 0, allele_2, b'.')
     
-    df1 = pd.DataFrame(allele_1.astype('U1'), index=positions, columns=sample_ids)
-    df2 = pd.DataFrame(allele_2.astype('U1'), index=positions, columns=sample_ids)
+    # Build haplotype strings: transpose to (n_samples, n_variants)
+    allele_1_T = allele_1.T.astype('U1')
+    allele_2_T = allele_2.T.astype('U1')
     
-    df1.index.name = 'position'
-    df2.index.name = 'position'
+    haplotype_1 = ['-'.join(row) for row in allele_1_T]
+    haplotype_2 = ['-'.join(row) for row in allele_2_T]
     
-    return df1, df2
-
-def get_haplotype_counts(region):
-    """Get haplotype distribution across all samples"""
-    allele_1_df, allele_2_df = get_all_sample_alleles(region)
+    all_haplotypes = haplotype_1 + haplotype_2
     
-    # Build haplotype string per sample: "A-T-G" (one allele per position)
-    haplotype_1 = allele_1_df.apply(lambda col: "-".join(col), axis=0)
-    haplotype_2 = allele_2_df.apply(lambda col: "-".join(col), axis=0)
-    
-    # Combine both haplotypes (each sample contributes 2 haplotypes)
-    all_haplotypes = pd.concat([haplotype_1, haplotype_2])
-    
-    # Count frequencies
-    counts = all_haplotypes.value_counts().reset_index()
+    counts = pd.Series(all_haplotypes).value_counts().reset_index()
     counts.columns = ['haplotype', 'count']
     counts['count'] = counts['count'] / 2
     counts['frequency'] = counts['count'] / len(all_haplotypes)
@@ -162,26 +157,25 @@ chunk_df = zarr_chunk_metadata()
 user_input = st.text_input("Insert region:", value="Pf3D7_07_v3:401,000-401,100")
 chrom, start_pos, end_pos = extract_locus(user_input)
 
-# Query region metadata (fast)
-matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
-region = query_region_lazy(chunk_df, chrom, start_pos, end_pos, variant_data)
+# Query region metadata (cached)
+region_meta, matching_chunks = query_region_metadata(variant_data, chunk_df, chrom, start_pos, end_pos)
 
 # Display results
 st.header("Results")
 
-if region is not None:
-    n_variants = region.dims['variants']
-    n_samples = region.dims['samples']
+if region_meta is not None:
+    n_variants = region_meta['n_variants']
+    n_samples = region_meta['n_samples']
     st.write(f"Found **{n_variants}** variants in `{chrom}:{start_pos:,}-{end_pos:,}`")
     
     if n_variants > 0:
         # Variant info table
         variant_df = pd.DataFrame({
-            'position': region.attrs['_positions'],
-            'is_snp': region["variant_is_snp"].values,
-            'filter_pass': region["variant_filter_pass"].values,
-            'CDS': region["variant_CDS"].values,
-            'numalt': region["variant_numalt"].values,
+            'position': region_meta['positions'],
+            'is_snp': region_meta['is_snp'],
+            'filter_pass': region_meta['filter_pass'],
+            'CDS': region_meta['CDS'],
+            'numalt': region_meta['numalt'],
         })
         st.dataframe(variant_df, width="stretch", hide_index=True)
         
@@ -189,27 +183,27 @@ if region is not None:
         st.subheader("Sample Genotypes")
         
         # Initialize session state
-        if 'region_with_gt' not in st.session_state:
-            st.session_state.region_with_gt = None
+        if 'genotypes' not in st.session_state:
+            st.session_state.genotypes = None
         if 'sample_idx' not in st.session_state:
             st.session_state.sample_idx = 0
+        if 'haplotype_df' not in st.session_state:
+            st.session_state.haplotype_df = None
         
-        # Check if genotypes are loaded
-        genotypes_loaded = st.session_state.region_with_gt is not None
+        genotypes_loaded = st.session_state.genotypes is not None
         
         if not genotypes_loaded:
             st.info(f"Genotypes not loaded. Click below to fetch data for {n_samples:,} samples.")
             if st.button("Load genotypes", type="primary"):
                 start = time.time()
                 with st.spinner(f"Fetching genotypes for {n_samples:,} samples..."):
-                    region = load_genotypes(region)
-                    st.session_state.region_with_gt = region
+                    st.session_state.genotypes = load_genotypes()
                     genotypes_loaded = True
                 st.toast(f"✅ Loaded in {time.time() - start:.1f}s")
         
         if genotypes_loaded:
-            region = st.session_state.region_with_gt
-            sample_ids = region.attrs['_sample_ids']
+            genotypes = st.session_state.genotypes
+            sample_ids = region_meta['sample_ids']
             
             selected_sample = st.selectbox(
                 "Select sample:",
@@ -222,7 +216,8 @@ if region is not None:
             
             # Display genotypes for selected sample
             start = time.time()
-            gt_df = get_sample_genotypes(region, st.session_state.sample_idx)
+            gt_df = get_sample_genotypes(region_meta, genotypes, st.session_state.sample_idx)
+            st.dataframe(gt_df, width="stretch", hide_index=True)
             st.caption(f"⏱️ Time taken to change sample: {time.time() - start:.3f}s")
             
             # Haplotype distribution
@@ -232,16 +227,14 @@ if region is not None:
             if st.button("Show haplotype counts"):
                 start = time.time()
                 with st.spinner("Computing haplotype frequencies..."):
-                    haplotype_df = get_haplotype_counts(region)
-                    st.session_state.haplotype_df = haplotype_df
+                    st.session_state.haplotype_df = get_haplotype_counts(region_meta, genotypes)
                 st.toast(f"✅ Computed in {time.time() - start:.2f}s")
             
-            if 'haplotype_df' in st.session_state:
+            if st.session_state.haplotype_df is not None:
                 haplotype_df = st.session_state.haplotype_df
                 
                 st.write(f"**{len(haplotype_df)}** unique haplotypes from **{n_samples * 2:,}** chromosomes")
                 
-                # Show top haplotypes
                 st.dataframe(
                     haplotype_df.head(100).style.format({'frequency': '{:.2%}'}),
                     width="stretch",
