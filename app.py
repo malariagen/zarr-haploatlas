@@ -149,7 +149,7 @@ def get_haplotype_counts(region):
     # Count frequencies
     counts = all_haplotypes.value_counts().reset_index()
     counts.columns = ['haplotype', 'count']
-    counts['frequency'] = counts['count'] / len(all_haplotypes)
+    counts['frequency'] = counts['count'] / len(all_haplotypes) / 2
     
     return counts
 
@@ -222,8 +222,7 @@ if region is not None:
             # Display genotypes for selected sample
             start = time.time()
             gt_df = get_sample_genotypes(region, st.session_state.sample_idx)
-            st.dataframe(gt_df, width="stretch", hide_index=True)
-            st.caption(f"⏱️ Single sample: {time.time() - start:.3f}s")
+            st.caption(f"⏱️ Time taken to change sample: {time.time() - start:.3f}s")
             
             # Haplotype distribution
             st.divider()
