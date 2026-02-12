@@ -233,10 +233,10 @@ if region_meta is not None:
             if st.session_state.haplotype_df is not None:
                 haplotype_df = st.session_state.haplotype_df
                 
-                st.write(f"**{len(haplotype_df)}** unique haplotypes from **{n_samples * 2:,}** chromosomes")
+                st.write(f"**{len(haplotype_df)}** unique haplotypes from **{n_samples:,}** samples")
                 
                 st.dataframe(
-                    haplotype_df.head(100).style.format({'frequency': '{:.2%}'}),
+                    haplotype_df.head(10).style.format({'frequency': '{:.2%}'}),
                     width="stretch",
                     hide_index=True
                 )
