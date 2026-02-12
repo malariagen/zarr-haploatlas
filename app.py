@@ -177,9 +177,11 @@ if region is not None:
             st.info(f"Genotypes not loaded. Click below to fetch data for {n_samples:,} samples.")
             if st.button("Load genotypes", type="primary"):
                 start = time.time()
+                
                 with st.spinner(f"Fetching genotypes for {n_samples:,} samples... (this may take a few minutes)"):
                     region = load_genotypes(region)
                     st.session_state.region_with_gt = region
+                
                 st.success(f"Loaded in {time.time() - start:.1f}s")
                 st.rerun()
         else:
@@ -216,12 +218,6 @@ if region is not None:
                 
                 st.caption(f"⏱️ All samples: {time.time() - start:.3f}s")
                 st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
-                
-                st.write("**Allele 1**")
-                st.dataframe(allele_1_df, width="stretch", hide_index=True)
-                
-                st.write("**Allele 2**")
-                st.dataframe(allele_2_df, width="stretch", hide_index=True)
 
 else:
     st.warning("No variants found in this region")
