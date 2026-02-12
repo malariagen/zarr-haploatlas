@@ -178,7 +178,7 @@ if region is not None:
             if st.button("Load genotypes", type="primary"):
                 start = time.time()
                 
-                with st.spinner(f"Fetching genotypes for {n_samples:,} samples... (this may take a few minutes)"):
+                with st.spinner(f"Fetching genotypes for {n_samples:,} samples..."):
                     region = load_genotypes(region)
                     st.session_state.region_with_gt = region
                 
@@ -218,6 +218,17 @@ if region is not None:
                 
                 st.caption(f"⏱️ All samples: {time.time() - start:.3f}s")
                 st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
+
+                # Concatenate alleles into genotypes like "A/T"
+                genotypes_df = allele_1_df + "/" + allele_2_df
+
+                # Value counts per position (row)
+                counts_per_position = genotypes_df.apply(lambda row: row.value_counts().to_dict(), axis=1)
+                st.dataframe(pd.DataFrame(counts_per_position.tolist(), index=genotypes_df.index))
+
+                # Or total counts across all positions
+                total_counts = genotypes_df.values.flatten()
+                st.dataframe(pd.Series(total_counts).value_counts(), width="stretch")
 
 else:
     st.warning("No variants found in this region")
