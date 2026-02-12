@@ -144,7 +144,7 @@ def get_haplotype_counts(region_meta, genotypes):
     
     counts = pd.Series(all_haplotypes).value_counts().reset_index()
     counts.columns = ['haplotype', 'count']
-    counts['count'] = counts['count'] / 2
+    counts['count'] = counts['count'] // 2
     counts['frequency'] = counts['count'] / len(all_haplotypes)
     
     return counts
