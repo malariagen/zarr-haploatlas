@@ -33,8 +33,8 @@ def load_chunk(chunk_df, chunk_id, variant_data):
     row = chunk_df[chunk_df['chunk'] == chunk_id].iloc[0]
     return variant_data.isel(variants=slice(int(row['slice_start']), int(row['slice_end'])))
 
-def query_region(chunk_df, chrom, start_pos, end_pos, variant_data):
-    """Load region and precompute all data eagerly"""
+def query_region_lazy(chunk_df, chrom, start_pos, end_pos, variant_data):
+    """Load region metadata only (fast) - no genotypes"""
     matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
     
     if len(matching_chunks) == 0:
@@ -56,16 +56,22 @@ def query_region(chunk_df, chrom, start_pos, end_pos, variant_data):
     
     result = region_data.isel(variants=mask)
     
-    # Preload ALL data eagerly - single network cost
+    # Preload only lightweight metadata
     result.attrs['_positions'] = result["variant_position"].values
     alleles = result["variant_allele"].values
     if alleles.dtype.kind == 'S':
         alleles = alleles.astype('U1')
     result.attrs['_alleles'] = alleles
-    result.attrs['_genotypes'] = result["call_genotype"].values.astype(np.int8)
     result.attrs['_sample_ids'] = result["sample_id"].values
+    result.attrs['_genotypes_loaded'] = False
     
     return result
+
+def load_genotypes(region):
+    """Load genotypes into region (slow network call)"""
+    region.attrs['_genotypes'] = region["call_genotype"].values.astype(np.int8)
+    region.attrs['_genotypes_loaded'] = True
+    return region
 
 def get_sample_genotypes(region, sample_idx):
     """Get genotypes for a single sample - uses cached data"""
@@ -108,24 +114,19 @@ def get_all_sample_alleles(region):
     gt1 = genotypes[:, :, 0]
     gt2 = genotypes[:, :, 1]
     
-    # Vectorized allele lookup
     row_idx = np.arange(n_variants)[:, np.newaxis]
     
-    # Use bytes for speed
     alleles_bytes = alleles.astype('S1') if alleles.dtype.kind == 'U' else alleles
     
-    # Lookup alleles (handles missing with clip, then mask)
     gt1_clipped = np.clip(gt1, 0, alleles.shape[1] - 1)
     gt2_clipped = np.clip(gt2, 0, alleles.shape[1] - 1)
     
     allele_1 = alleles_bytes[row_idx, gt1_clipped]
     allele_2 = alleles_bytes[row_idx, gt2_clipped]
     
-    # Mask missing values
     allele_1 = np.where(gt1 >= 0, allele_1, b'.')
     allele_2 = np.where(gt2 >= 0, allele_2, b'.')
     
-    # Convert to unicode at the end
     df1 = pd.DataFrame(allele_1.astype('U1'), index=positions, columns=sample_ids)
     df2 = pd.DataFrame(allele_2.astype('U1'), index=positions, columns=sample_ids)
     
@@ -139,14 +140,12 @@ variant_data = load_full_variant_data()
 chunk_df = zarr_chunk_metadata()
 
 # User input
-user_input = st.text_input("Query region:", value="Pf3D7_07_v3:401,000-401,100")
+user_input = st.text_input("Insert region:", value="Pf3D7_07_v3:401,000-401,100")
 chrom, start_pos, end_pos = extract_locus(user_input)
 
-# Query region (this now does all the heavy lifting)
-start = time.time()
+# Query region metadata (fast)
 matching_chunks = find_chunks_for_region(chunk_df, chrom, start_pos, end_pos)
-region = query_region(chunk_df, chrom, start_pos, end_pos, variant_data)
-query_time = time.time() - start
+region = query_region_lazy(chunk_df, chrom, start_pos, end_pos, variant_data)
 
 # Display results
 st.header("Results")
@@ -154,8 +153,7 @@ st.header("Results")
 if region is not None:
     n_variants = region.dims['variants']
     n_samples = region.dims['samples']
-    st.write(f"Found **{n_variants}** variants.")
-    st.caption(f"⏱️ Region loaded in {query_time:.2f}s")
+    st.write(f"Found **{n_variants}** variants in `{chrom}:{start_pos:,}-{end_pos:,}`")
     
     if n_variants > 0:
         # Variant info table
@@ -171,47 +169,59 @@ if region is not None:
         st.divider()
         st.subheader("Sample Genotypes")
         
-        # Sample selector
-        sample_ids = region.attrs['_sample_ids']
+        # Load genotypes button
+        if 'region_with_gt' not in st.session_state:
+            st.session_state.region_with_gt = None
         
-        # Initialize session state
-        if 'sample_idx' not in st.session_state:
-            st.session_state.sample_idx = 0
-        
-        selected_sample = st.selectbox(
-            "Select sample:",
-            options=range(n_samples),
-            format_func=lambda i: f"{i+1}/{n_samples}: {sample_ids[i]}",
-            index=st.session_state.sample_idx,
-            key="sample_select"
-        )
-        st.session_state.sample_idx = selected_sample
-        
-        # Display genotypes for selected sample
-        sample_idx = st.session_state.sample_idx
-        
-        start = time.time()
-        gt_df = get_sample_genotypes(region, sample_idx)
-        st.dataframe(gt_df, width="stretch", hide_index=True)
-        st.caption(f"⏱️ Single sample: {time.time() - start:.3f}s")
-        
-        # Load all samples button
-        st.divider()
-        st.subheader("All Samples")
-        
-        if st.button("Load all samples"):
+        if st.session_state.region_with_gt is None:
+            st.info(f"Genotypes not loaded. Click below to fetch data for {n_samples:,} samples.")
+            if st.button("Load genotypes", type="primary"):
+                start = time.time()
+                with st.spinner(f"Fetching genotypes for {n_samples:,} samples... (this may take a few minutes)"):
+                    region = load_genotypes(region)
+                    st.session_state.region_with_gt = region
+                st.success(f"Loaded in {time.time() - start:.1f}s")
+                st.rerun()
+        else:
+            region = st.session_state.region_with_gt
+            
+            # Sample selector
+            sample_ids = region.attrs['_sample_ids']
+            
+            if 'sample_idx' not in st.session_state:
+                st.session_state.sample_idx = 0
+            
+            selected_sample = st.selectbox(
+                "Select sample:",
+                options=range(n_samples),
+                format_func=lambda i: f"{i+1}/{n_samples}: {sample_ids[i]}",
+                index=st.session_state.sample_idx,
+                key="sample_select"
+            )
+            st.session_state.sample_idx = selected_sample
+            
+            # Display genotypes for selected sample
             start = time.time()
-            allele_1_df, allele_2_df = get_all_sample_alleles(region)
+            gt_df = get_sample_genotypes(region, st.session_state.sample_idx)
+            st.dataframe(gt_df, width="stretch", hide_index=True)
+            st.caption(f"⏱️ Single sample: {time.time() - start:.3f}s")
             
-            st.caption(f"⏱️ All samples: {time.time() - start:.0f}s")
+            # Load all samples button
+            st.divider()
+            st.subheader("All Samples")
             
-            st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
-            
-            st.write("**Allele 1**")
-            st.dataframe(allele_1_df, width="stretch", hide_index=True)
-            
-            st.write("**Allele 2**")
-            st.dataframe(allele_2_df, width="stretch", hide_index=True)
+            if st.button("Show all samples"):
+                start = time.time()
+                allele_1_df, allele_2_df = get_all_sample_alleles(region)
+                
+                st.caption(f"⏱️ All samples: {time.time() - start:.3f}s")
+                st.write(f"Shape: {allele_1_df.shape[0]} positions × {allele_1_df.shape[1]} samples")
+                
+                st.write("**Allele 1**")
+                st.dataframe(allele_1_df, width="stretch", hide_index=True)
+                
+                st.write("**Allele 2**")
+                st.dataframe(allele_2_df, width="stretch", hide_index=True)
 
 else:
     st.warning("No variants found in this region")
