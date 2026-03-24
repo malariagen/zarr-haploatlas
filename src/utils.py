@@ -196,7 +196,6 @@ def resolve_loci(loci_df: pd.DataFrame, exon_gff: pd.DataFrame) -> dict:
 
 # ── Variant querying ──────────────────────────────────────────────────────────
 
-@st.cache_data
 def query_locus_metadata(_variant_data, _chunk_index_df,
                          source_id: str, locus_intervals: tuple) -> dict | None:
     """
