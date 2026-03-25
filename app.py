@@ -10,7 +10,7 @@ from src.utils import (
 )
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
-st.set_page_config(layout="wide", page_title="Pf Haplotype Explorer")
+st.set_page_config(layout="wide", page_title="FIX ME")
 
 # ── Load static data ──────────────────────────────────────────────────────────
 chunk_index_df  = build_chunk_index()
@@ -142,7 +142,7 @@ else:
             haplotype_result = haplotype_result.sort_values(
                 "n_samples", ascending=False
             ).reset_index(drop=True)
-            haplotype_result.insert(0, "id", [f"H{i+1}" for i in range(len(haplotype_result))])
+            haplotype_result.insert(0, "id", [f"H{(i+1):03d}" for i in range(len(haplotype_result))])
             # Build sample → id mapping for the allele matrix
             st.session_state["sample_to_id"] = {
                 sid: row["id"]
