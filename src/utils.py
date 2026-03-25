@@ -63,9 +63,9 @@ def build_chunk_index() -> pd.DataFrame:
         chunk_chrom = chrom_var.isel(variants=slice(chunk_start, chunk_end)).values
 
         for chrom in np.unique(chunk_chrom):
-            chrom_mask     = chunk_chrom == chrom
+            chrom_mask      = chunk_chrom == chrom
             chrom_positions = chunk_pos[chrom_mask]
-            chrom_indices  = np.where(chrom_mask)[0]
+            chrom_indices   = np.where(chrom_mask)[0]
 
             chunk_index.append({
                 "chunk":       i,
@@ -118,10 +118,8 @@ def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
 
     chrom  = exons["seqid"].iloc[0]
     strand = exons["strand"].iloc[0]
-    # Sort exons in CDS order (ascending for +, descending for -)
     exons  = exons.sort_values("start", ascending=(strand == "+"))
 
-    # Build CDS-coordinate segments
     cds_offset = 1
     segments   = []
     for _, exon in exons.iterrows():
@@ -197,12 +195,15 @@ def resolve_loci(loci_df: pd.DataFrame, exon_gff: pd.DataFrame) -> dict:
 # ── Variant querying ──────────────────────────────────────────────────────────
 
 def query_locus_metadata(_variant_data, _chunk_index_df,
-                         source_id: str, locus_intervals: tuple) -> dict | None:
+                         locus_intervals: tuple) -> tuple[dict, xr.Dataset] | None:
     """
     Query variant metadata for a set of genomic intervals.
 
     Args:
-        locus_intervals: tuple of (chrom, start, end) - must be a tuple for cache hashing.
+        locus_intervals: tuple of (chrom, start, end) — must be a tuple for cache hashing.
+
+    Returns:
+        (meta dict, xr.Dataset) or None if no variants found.
     """
     interval_datasets = []
 
@@ -239,88 +240,90 @@ def query_locus_metadata(_variant_data, _chunk_index_df,
     if not interval_datasets:
         return None
 
-    result = (
+    ds = (
         xr.concat(interval_datasets, dim="variants")
         if len(interval_datasets) > 1
         else interval_datasets[0]
     )
 
-    alleles = result["variant_allele"].values
+    alleles = ds["variant_allele"].values
     if alleles.dtype.kind == "S":
         alleles = alleles.astype("U1")
 
-    region_meta = {
-        "positions":   result["variant_position"].values,
+    meta = {
+        "positions":   ds["variant_position"].values,
         "alleles":     alleles,
-        "sample_ids":  result["sample_id"].values,
-        "is_snp":      result["variant_is_snp"].values,
-        "filter_pass": result["variant_filter_pass"].values,
-        "CDS":         result["variant_CDS"].values,
-        "numalt":      result["variant_numalt"].values,
-        "n_variants":  result.dims["variants"],
-        "n_samples":   result.dims["samples"],
+        "sample_ids":  ds["sample_id"].values,
+        "is_snp":      ds["variant_is_snp"].values,
+        "filter_pass": ds["variant_filter_pass"].values,
+        "CDS":         ds["variant_CDS"].values,
+        "numalt":      ds["variant_numalt"].values,
+        "n_variants":  ds.dims["variants"],
+        "n_samples":   ds.dims["samples"],
     }
 
-    # Stash xarray dataset in session state for deferred genotype loading
-    st.session_state[f"_region_xr_{source_id}"] = result
-
-    return region_meta
+    return meta, ds
 
 
-def load_genotypes(source_id: str) -> np.ndarray:
-    return (
-        st.session_state[f"_region_xr_{source_id}"]["call_genotype"]
-        .values
-        .astype(np.int8)
-    )
+def filter_region_by_intervals(meta: dict, ds: xr.Dataset,
+                                intervals: list[tuple]) -> tuple[dict, xr.Dataset] | None:
+    """
+    Post-filter a queried region to variants whose REF footprint overlaps at least
+    one of the given intervals. Handles long REF alleles from upstream indels.
+    """
+    positions = meta["positions"]
+    alleles   = meta["alleles"]
+    keep_mask = np.zeros(len(positions), dtype=bool)
+
+    for vi in range(len(positions)):
+        vpos    = int(positions[vi])
+        v_end   = vpos + len(str(alleles[vi][0])) - 1
+        for _, iv_start, iv_end in intervals:
+            if vpos <= iv_end and v_end >= iv_start:
+                keep_mask[vi] = True
+                break
+
+    if not keep_mask.any():
+        return None
+
+    keep_idx      = np.where(keep_mask)[0]
+    filtered_meta = {
+        "positions":   positions[keep_idx],
+        "alleles":     alleles[keep_idx],
+        "sample_ids":  meta["sample_ids"],
+        "is_snp":      meta["is_snp"][keep_idx],
+        "filter_pass": meta["filter_pass"][keep_idx],
+        "CDS":         meta["CDS"][keep_idx],
+        "numalt":      meta["numalt"][keep_idx],
+        "n_variants":  int(keep_idx.shape[0]),
+        "n_samples":   meta["n_samples"],
+    }
+    return filtered_meta, ds.isel(variants=keep_idx)
 
 
-# ── Haplotype helpers ─────────────────────────────────────────────────────────
+def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dict]:
+    """Build display rows for the variant metadata table."""
+    coord_type  = locus_info["coord_type"]
+    locus_chrom = locus_info["intervals"][0][0] if locus_info["intervals"] else ""
+    rows = []
+    for vi in range(meta["n_variants"]):
+        ref_allele = str(meta["alleles"][vi][0])
+        alts = [str(a) for a in meta["alleles"][vi][1:] if str(a).strip()]
+        rows.append({
+            "chrom":             locus_chrom,
+            "position":          meta["positions"][vi],
+            "source":            source_id,
+            "needs_translation": coord_type == "aa",
+            "ref":               ref_allele,
+            "ref_len":           len(ref_allele),
+            "alt":               ", ".join(alts),
+            "is_snp":            meta["is_snp"][vi],
+            "filter_pass":       meta["filter_pass"][vi],
+            "CDS":               meta["CDS"][vi],
+            "numalt":            meta["numalt"][vi],
+        })
+    return rows
 
-def get_sample_genotypes(region_meta: dict, genotypes: np.ndarray,
-                         sample_idx: int) -> pd.DataFrame:
-    positions  = region_meta["positions"]
-    alleles    = region_meta["alleles"]
-    gt         = genotypes[:, sample_idx, :]
-    n_variants = len(positions)
-    gt1, gt2   = gt[:, 0], gt[:, 1]
-    row_idx    = np.arange(n_variants)
-    valid1, valid2 = gt1 >= 0, gt2 >= 0
 
-    allele_1 = np.full(n_variants, ".", dtype="U1")
-    allele_2 = np.full(n_variants, ".", dtype="U1")
-    allele_1[valid1] = alleles[row_idx[valid1], gt1[valid1]]
-    allele_2[valid2] = alleles[row_idx[valid2], gt2[valid2]]
-
-    return pd.DataFrame({
-        "position": positions,
-        "allele_1": allele_1,
-        "allele_2": allele_2,
-    })
-
-
-def get_haplotype_counts(region_meta: dict, genotypes: np.ndarray) -> pd.DataFrame:
-    alleles    = region_meta["alleles"]
-    n_variants, n_samples, _ = genotypes.shape
-
-    gt1 = genotypes[:, :, 0]
-    gt2 = genotypes[:, :, 1]
-    row_idx = np.arange(n_variants)[:, np.newaxis]
-
-    alleles_bytes = alleles.astype("S1") if alleles.dtype.kind == "U" else alleles
-    gt1_c = np.clip(gt1, 0, alleles.shape[1] - 1)
-    gt2_c = np.clip(gt2, 0, alleles.shape[1] - 1)
-
-    a1 = np.where(gt1 >= 0, alleles_bytes[row_idx, gt1_c], b".")
-    a2 = np.where(gt2 >= 0, alleles_bytes[row_idx, gt2_c], b".")
-
-    hap1 = ["-".join(r) for r in a1.T.astype("U1")]
-    hap2 = ["-".join(r) for r in a2.T.astype("U1")]
-    all_haplotypes = hap1 + hap2
-
-    counts = pd.Series(all_haplotypes).value_counts().reset_index()
-    counts.columns = ["haplotype", "count"]
-    counts["count"]     = counts["count"] // 2
-    counts["frequency"] = counts["count"] / len(all_haplotypes) * 2
-
-    return counts
+def load_genotypes(ds: xr.Dataset) -> np.ndarray:
+    return ds["call_genotype"].values.astype(np.int8)
