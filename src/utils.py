@@ -248,7 +248,9 @@ def query_locus_metadata(_variant_data, _chunk_index_df,
 
     alleles = ds["variant_allele"].values
     if alleles.dtype.kind == "S":
-        alleles = alleles.astype("U1")
+        alleles = alleles.astype("U")   # decode bytes → unicode, preserving full allele length
+    # strip trailing '-' and null padding (zarr fixed-width allele convention)
+    alleles = np.vectorize(lambda s: s.rstrip("-\x00"))(alleles)
 
     meta = {
         "positions":   ds["variant_position"].values,

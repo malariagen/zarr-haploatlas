@@ -93,9 +93,16 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
     for pos_str, info in sorted_pos_info:
         observed = alleles_here.get(pos_str, info["ref"])
         ref_a    = info["ref"]
-        off      = info["offset"] + running_offset
 
-        if observed in (ref_a, "*", "~"):
+        # Strip trailing '-' zarr padding from allele strings.
+        # "~" and "-" alone are our special markers (het / missing) — leave them untouched.
+        if observed not in ("~", "-"):
+            observed = observed.rstrip("-\x00")
+        ref_a = ref_a.rstrip("-\x00")
+
+        off = info["offset"] + running_offset
+
+        if observed in (ref_a, "*", "~", "-"):
             continue
 
         ref_len = len(ref_a)
@@ -174,44 +181,63 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
 
     sorted_pos_info = sorted(pos_info.items(), key=lambda x: x[1]["offset"])
 
+    # Reverse map: 1-based AA position → variant pos_strs whose codon it belongs to
+    aa_to_pos: dict[int, list[str]] = {}
+    for pos_str, info in pos_info.items():
+        aa_pos = info["offset"] // 3 + 1
+        aa_to_pos.setdefault(aa_pos, []).append(pos_str)
+
     haplotypes     = []
     ns_changes_col = []
 
     for _, row in deduped.iterrows():
         alleles_here = {p: row[p] for p in pos_info if p in deduped.columns}
-        has_missing  = any(v == "-" for v in alleles_here.values())
-        has_het      = any(v == "~" for v in alleles_here.values())
-
-        if has_missing:
-            haplotypes.append("-")
-            ns_changes_col.append("-")
-            continue
 
         alt_cds = _apply_variants(ref_cds, sorted_pos_info, alleles_here)
         alt_aa  = _translate(alt_cds, strand)
-        suffix  = "~" if has_het else ""
 
         hap_parts = []
-        ns_parts  = []
+        ns_list   = []
+
         for aa_start, aa_end in aa_ranges:
-            ref_slice = ref_aa[aa_start - 1 : aa_end] if len(ref_aa) >= aa_end else ""
-            alt_slice = alt_aa[aa_start - 1 : aa_end] if len(alt_aa) >= aa_end else ""
-
-            if not ref_slice or len(ref_slice) != len(alt_slice):
-                hap_parts.append("!")
-                ns_parts.append("!")
-                continue
-
-            hap_parts.append(alt_slice)
-            changes = [
-                f"{ref_slice[i]}{aa_start + i}{alt_slice[i]}"
-                for i in range(len(ref_slice))
-                if ref_slice[i] != alt_slice[i]
+            # Per-range status: check variants whose codon falls in this range
+            range_variants = [
+                alleles_here.get(p)
+                for aa_pos in range(aa_start, aa_end + 1)
+                for p in aa_to_pos.get(aa_pos, [])
             ]
-            ns_parts.append("/".join(changes))
+            range_has_missing = "-" in range_variants
+            range_has_het     = "~" in range_variants
 
-        haplotypes.append(",".join(hap_parts) + suffix)
-        ns_changes_col.append(",".join(ns_parts) + suffix)
+            if range_has_missing:
+                hap_parts.append("-")
+            elif range_has_het:
+                hap_parts.append("~")
+            else:
+                ref_slice = ref_aa[aa_start - 1 : aa_end] if len(ref_aa) >= aa_end else ""
+                alt_slice = alt_aa[aa_start - 1 : aa_end] if len(alt_aa) >= aa_end else ""
+                if not ref_slice or len(ref_slice) != len(alt_slice):
+                    hap_parts.append("!")
+                else:
+                    hap_parts.append(alt_slice)
+
+            # Per-AA-position ns_changes entries
+            for aa_pos in range(aa_start, aa_end + 1):
+                codon_variants = aa_to_pos.get(aa_pos, [])
+                is_missing = any(alleles_here.get(p) == "-" for p in codon_variants)
+                is_het     = any(alleles_here.get(p) == "~" for p in codon_variants)
+                ref_a = ref_aa[aa_pos - 1] if len(ref_aa) >= aa_pos else "?"
+                alt_a = alt_aa[aa_pos - 1] if len(alt_aa) >= aa_pos else "?"
+
+                if is_missing:
+                    ns_list.append(f"{ref_a}{aa_pos}-")
+                elif is_het:
+                    ns_list.append(f"{ref_a}{aa_pos}~")
+                elif ref_a != alt_a:
+                    ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
+
+        haplotypes.append(",".join(hap_parts))
+        ns_changes_col.append(str(ns_list))
 
     result[f"{source_id}_haplotype"]  = haplotypes
     result[f"{source_id}_ns_changes"] = ns_changes_col
