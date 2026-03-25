@@ -31,6 +31,7 @@ RAW_USER_INPUT = st.text_input(
 if st.session_state.get("last_input") != RAW_USER_INPUT:
     st.session_state.pop("regions", None)
     st.session_state.pop("haplotype_result", None)
+    st.session_state.pop("sample_to_id", None)
     st.session_state["last_input"] = RAW_USER_INPUT
 
 loci_df  = parse_loci_from_input(RAW_USER_INPUT)
@@ -117,7 +118,14 @@ if not genotypes_loaded:
         st.toast(f"✅ Loaded in {time.time() - t0:.1f}s")
 else:
     allele_matrix = build_allele_matrix(regions)
-    st.dataframe(allele_matrix, use_container_width=True)
+
+    # Prepend haplotype ID column once haplotypes have been computed
+    if "sample_to_id" in st.session_state:
+        display_matrix = allele_matrix.copy()
+        display_matrix.insert(0, "id", display_matrix.index.map(st.session_state["sample_to_id"]))
+    else:
+        display_matrix = allele_matrix
+    st.dataframe(display_matrix, use_container_width=True)
 
     # ── Haplotypes ────────────────────────────────────────────────────────
     st.divider()
@@ -130,16 +138,33 @@ else:
             haplotype_result = compute_haplotypes(
                 deduped, regions, resolved, loci_df, reference_files["cds_gff"]
             )
+            # Assign H1, H2, … sorted by frequency descending
+            haplotype_result = haplotype_result.sort_values(
+                "n_samples", ascending=False
+            ).reset_index(drop=True)
+            haplotype_result.insert(0, "id", [f"H{i+1}" for i in range(len(haplotype_result))])
+            # Build sample → id mapping for the allele matrix
+            st.session_state["sample_to_id"] = {
+                sid: row["id"]
+                for _, row in haplotype_result.iterrows()
+                for sid in row["sample_ids"]
+            }
             st.session_state["haplotype_result"] = haplotype_result
         st.toast(f"✅ Computed in {time.time() - t0:.2f}s")
+        st.rerun()
 
     if "haplotype_result" in st.session_state:
-        result  = st.session_state["haplotype_result"]
+        result   = st.session_state["haplotype_result"]
         hap_cols = [c for c in result.columns
                     if c.endswith(("_haplotype", "_ns_changes"))]
         st.dataframe(
-            result[["n_samples"] + hap_cols].sort_values("n_samples", ascending=False),
+            result[["id", "n_samples"] + hap_cols],
             use_container_width=True, hide_index=True,
+        )
+        st.caption(
+            "Rows with identical haplotype values but different IDs share the same called "
+            "amino acid / nucleotide sequence but differ at variant positions outside the "
+            "queried ranges."
         )
 
 
