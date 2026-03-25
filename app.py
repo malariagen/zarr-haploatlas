@@ -67,8 +67,7 @@ for source_id, locus_info in resolved.items():
         (chrom, max(1, start - UPSTREAM_PAD), end)
         for chrom, start, end in intervals
     )
-
-    # NOT cached — re-runs each time, freshly sets _region_xr_ in session state
+    
     region_meta = query_locus_metadata(
         variant_data, chunk_index_df,
         source_id, padded_intervals,

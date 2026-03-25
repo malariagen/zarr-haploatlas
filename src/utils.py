@@ -185,7 +185,7 @@ def resolve_loci(loci_df: pd.DataFrame, exon_gff: pd.DataFrame) -> dict:
                     source_id, int(row["start"]), int(row["end"]), exon_gff
                 )
                 if not aa_intervals:
-                    st.warning(f"Could not resolve AA positions {row['start']}–{row['end']} "
+                    st.warning(f"Could not resolve AA positions {row['start']} - {row['end']} "
                                f"for `{source_id}`")
                 intervals.extend(aa_intervals)
 
@@ -202,7 +202,7 @@ def query_locus_metadata(_variant_data, _chunk_index_df,
     Query variant metadata for a set of genomic intervals.
 
     Args:
-        locus_intervals: tuple of (chrom, start, end) – must be a tuple for cache hashing.
+        locus_intervals: tuple of (chrom, start, end) - must be a tuple for cache hashing.
     """
     interval_datasets = []
 
