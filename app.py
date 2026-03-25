@@ -123,7 +123,7 @@ else:
     # Prepend haplotype ID column once haplotypes have been computed
     if "sample_to_id" in st.session_state:
         display_matrix = allele_matrix.copy()
-        display_matrix.insert(0, "id", display_matrix.index.map(st.session_state["sample_to_id"]))
+        display_matrix.insert(0, "combination_id", display_matrix.index.map(st.session_state["sample_to_id"]))
     else:
         display_matrix = allele_matrix
     st.dataframe(display_matrix, width="stretch")
@@ -136,37 +136,44 @@ else:
         t0 = time.time()
         with st.spinner("Computing haplotypes…"):
             deduped = deduplicate_allele_matrix(allele_matrix)
-            haplotype_result = compute_haplotypes(
+            raw = compute_haplotypes(
                 deduped, regions, resolved, loci_df, reference_files["cds_gff"]
             )
-            # Assign H1, H2, … sorted by frequency descending
-            haplotype_result = haplotype_result.sort_values(
-                "n_samples", ascending=False
-            ).reset_index(drop=True)
-            n_digits = int(np.log10(len(haplotype_result))) + 1
-            haplotype_result.insert(0, "id", [f"H{(i+1):0{n_digits}d}" for i in range(len(haplotype_result))])
-            # Build sample → id mapping for the allele matrix
+
+            # ── Allele combination IDs (one per unique allele pattern) ──────
+            raw = raw.sort_values("n_samples", ascending=False).reset_index(drop=True)
+            w   = int(np.log10(max(len(raw), 1))) + 1
+            raw.insert(0, "combination_id", [f"C{i+1:0{w}d}" for i in range(len(raw))])
+
             st.session_state["sample_to_id"] = {
-                sid: row["id"]
-                for _, row in haplotype_result.iterrows()
+                sid: row["combination_id"]
+                for _, row in raw.iterrows()
                 for sid in row["sample_ids"]
             }
-            st.session_state["haplotype_result"] = haplotype_result
+
+            # ── Haplotype IDs (one per unique haplotype, collapsing duplicates) ──
+            hap_cols = [c for c in raw.columns if c.endswith(("_haplotype", "_ns_changes"))]
+            haplotypes = (
+                raw.groupby(hap_cols, sort=False)
+                .agg(n_samples=("n_samples", "sum"),
+                     combination_ids=("combination_id", list))
+                .reset_index()
+                .sort_values("n_samples", ascending=False)
+                .reset_index(drop=True)
+            )
+            wh = int(np.log10(max(len(haplotypes), 1))) + 1
+            haplotypes.insert(0, "haplotype_id", [f"H{i+1:0{wh}d}" for i in range(len(haplotypes))])
+
+            st.session_state["haplotype_result"] = haplotypes
         st.toast(f"✅ Computed in {time.time() - t0:.2f}s")
         st.rerun()
 
     if "haplotype_result" in st.session_state:
         result   = st.session_state["haplotype_result"]
-        hap_cols = [c for c in result.columns
-                    if c.endswith(("_haplotype", "_ns_changes"))]
+        hap_cols = [c for c in result.columns if c.endswith(("_haplotype", "_ns_changes"))]
         st.dataframe(
-            result[["id", "n_samples"] + hap_cols],
+            result[["haplotype_id", "n_samples", "combination_ids"] + hap_cols],
             width="stretch", hide_index=True,
-        )
-        st.caption(
-            "Rows with identical haplotype values but different IDs share the same called "
-            "amino acid / nucleotide sequence but differ at variant positions outside the "
-            "queried ranges."
         )
 
 
