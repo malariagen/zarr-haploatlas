@@ -8,6 +8,7 @@ from src.utils import (
     query_locus_metadata, filter_region_by_intervals,
     build_variant_rows, load_genotypes, build_allele_matrix,
 )
+from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
 st.set_page_config(layout="wide", page_title="Pf Haplotype Explorer")
 
@@ -19,7 +20,7 @@ variant_data    = load_variant_data()
 # ── User input ────────────────────────────────────────────────────────────────
 RAW_USER_INPUT = st.text_input(
     "Enter genomic loci",
-    value="PF3D7_0709000[72-76,326] Pf3D7_04_v3[104205,139150-139156]",
+    value="PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
     help=(
         "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · "
         "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
@@ -29,10 +30,11 @@ RAW_USER_INPUT = st.text_input(
 
 if st.session_state.get("last_input") != RAW_USER_INPUT:
     st.session_state.pop("regions", None)
+    st.session_state.pop("haplotype_result", None)
     st.session_state["last_input"] = RAW_USER_INPUT
 
 loci_df  = parse_loci_from_input(RAW_USER_INPUT)
-resolved = resolve_loci(loci_df, reference_files["exon_gff"])
+resolved = resolve_loci(loci_df, reference_files["cds_gff"])
 
 if loci_df.empty:
     st.info("Enter one or more loci above to begin.")
@@ -113,10 +115,32 @@ if not genotypes_loaded:
             for region in regions.values():
                 region["genotypes"] = load_genotypes(region["ds"])
         st.toast(f"✅ Loaded in {time.time() - t0:.1f}s")
-        st.rerun()
 else:
     allele_matrix = build_allele_matrix(regions)
     st.dataframe(allele_matrix, use_container_width=True)
+
+    # ── Haplotypes ────────────────────────────────────────────────────────
+    st.divider()
+    st.header("Haplotypes")
+
+    if st.button("Compute haplotypes", type="primary"):
+        t0 = time.time()
+        with st.spinner("Computing haplotypes…"):
+            deduped = deduplicate_allele_matrix(allele_matrix)
+            haplotype_result = compute_haplotypes(
+                deduped, regions, resolved, loci_df, reference_files["cds_gff"]
+            )
+            st.session_state["haplotype_result"] = haplotype_result
+        st.toast(f"✅ Computed in {time.time() - t0:.2f}s")
+
+    if "haplotype_result" in st.session_state:
+        result  = st.session_state["haplotype_result"]
+        hap_cols = [c for c in result.columns
+                    if c.endswith(("_haplotype", "_ns_changes"))]
+        st.dataframe(
+            result[["n_samples"] + hap_cols].sort_values("n_samples", ascending=False),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

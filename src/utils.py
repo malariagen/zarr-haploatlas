@@ -30,7 +30,7 @@ def load_reference_files() -> dict:
         .sort_values("gene_id")
     )
     return {
-        "exon_gff": gff[gff["type"] == "exon"].reset_index(drop=True)
+        "cds_gff": gff[gff["type"] == "CDS"].reset_index(drop=True),
     }
 
 
@@ -110,9 +110,9 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
 
 
 def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
-                              exon_gff: pd.DataFrame) -> list[tuple]:
+                              cds_gff: pd.DataFrame) -> list[tuple]:
     """Map a single AA range to a list of (chrom, genomic_start, genomic_end) intervals."""
-    exons = exon_gff[exon_gff["gene_id"] == gene_id].copy()
+    exons = cds_gff[cds_gff["gene_id"] == gene_id].copy()
     if exons.empty:
         return []
 
@@ -157,7 +157,7 @@ def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
     return intervals
 
 
-def resolve_loci(loci_df: pd.DataFrame, exon_gff: pd.DataFrame) -> dict:
+def resolve_loci(loci_df: pd.DataFrame, cds_gff: pd.DataFrame) -> dict:
     """
     Group loci by source identifier and resolve to genomic (NT) intervals.
 
@@ -180,7 +180,7 @@ def resolve_loci(loci_df: pd.DataFrame, exon_gff: pd.DataFrame) -> dict:
                 intervals.append((source_id, int(row["start"]), int(row["end"])))
             else:
                 aa_intervals = _aa_to_genomic_intervals(
-                    source_id, int(row["start"]), int(row["end"]), exon_gff
+                    source_id, int(row["start"]), int(row["end"]), cds_gff
                 )
                 if not aa_intervals:
                     st.warning(f"Could not resolve AA positions {row['start']} - {row['end']} "
