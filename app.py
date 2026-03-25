@@ -1,5 +1,6 @@
 import time
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 from src.utils import (
@@ -142,7 +143,8 @@ else:
             haplotype_result = haplotype_result.sort_values(
                 "n_samples", ascending=False
             ).reset_index(drop=True)
-            haplotype_result.insert(0, "id", [f"H{(i+1):03d}" for i in range(len(haplotype_result))])
+            n_digits = int(np.log10(len(haplotype_result))) + 1
+            haplotype_result.insert(0, "id", [f"H{(i+1):0{n_digits}d}" for i in range(len(haplotype_result))])
             # Build sample → id mapping for the allele matrix
             st.session_state["sample_to_id"] = {
                 sid: row["id"]
