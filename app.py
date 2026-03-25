@@ -92,7 +92,7 @@ meta_df     = pd.DataFrame(meta_rows)
 n_samples   = next(iter(regions.values()))["meta"]["n_samples"]
 total_vars  = sum(r["meta"]["n_variants"] for r in regions.values())
 
-st.dataframe(meta_df, use_container_width=True, hide_index=True)
+st.dataframe(meta_df, width="stretch", hide_index=True)
 st.caption(
     f"{total_vars} variant sites across {len(regions)} loci · "
     f"{n_samples:,} samples · "
@@ -126,7 +126,7 @@ else:
         display_matrix.insert(0, "id", display_matrix.index.map(st.session_state["sample_to_id"]))
     else:
         display_matrix = allele_matrix
-    st.dataframe(display_matrix, use_container_width=True)
+    st.dataframe(display_matrix, width="stretch")
 
     # ── Haplotypes ────────────────────────────────────────────────────────
     st.divider()
@@ -161,7 +161,7 @@ else:
                     if c.endswith(("_haplotype", "_ns_changes"))]
         st.dataframe(
             result[["id", "n_samples"] + hap_cols],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
         st.caption(
             "Rows with identical haplotype values but different IDs share the same called "
@@ -175,7 +175,7 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 with st.expander("Inner workings"):
     st.write("**Parsed loci:**")
-    st.dataframe(loci_df, hide_index=True)
+    st.dataframe(loci_df, width="stretch", hide_index=True)
     st.write("**Resolved genomic intervals:**")
     for sid, info in resolved.items():
         st.text(f"{sid} ({info['coord_type']}): {info['intervals']}")
