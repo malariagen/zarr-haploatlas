@@ -6,7 +6,7 @@ from src.utils import (
     build_chunk_index, load_reference_files, load_variant_data,
     parse_loci_from_input, resolve_loci,
     query_locus_metadata, filter_region_by_intervals,
-    build_variant_rows, load_genotypes,
+    build_variant_rows, load_genotypes, build_allele_matrix,
 )
 
 st.set_page_config(layout="wide", page_title="Pf Haplotype Explorer")
@@ -115,7 +115,8 @@ if not genotypes_loaded:
         st.toast(f"✅ Loaded in {time.time() - t0:.1f}s")
         st.rerun()
 else:
-    sample_ids = next(iter(regions.values()))["meta"]["sample_ids"]
+    allele_matrix = build_allele_matrix(regions)
+    st.dataframe(allele_matrix, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

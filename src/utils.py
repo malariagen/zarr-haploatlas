@@ -327,3 +327,54 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
 
 def load_genotypes(ds: xr.Dataset) -> np.ndarray:
     return ds["call_genotype"].values.astype(np.int8)
+
+
+def build_allele_matrix(regions: dict) -> pd.DataFrame:
+    """
+    Build a samples × positions DataFrame of called alleles.
+
+    Columns are labelled "chrom:pos". Cells show the allele string:
+    homozygous → single allele, heterozygous → "A/T", missing → ".".
+    """
+    col_labels = []
+    col_arrays = []
+
+    sample_ids = None
+
+    for region in regions.values():
+        meta      = region["meta"]
+        genotypes = region["genotypes"]   # (n_variants, n_samples, 2)
+        positions = meta["positions"]
+
+        if sample_ids is None:
+            sample_ids = meta["sample_ids"]
+
+        for vi in range(meta["n_variants"]):
+            gt1 = genotypes[vi, :, 0]   # (n_samples,)
+            gt2 = genotypes[vi, :, 1]
+
+            allele_row = meta["alleles"][vi]
+            n_alleles  = allele_row.shape[0]
+
+            gt1c = np.clip(gt1, 0, n_alleles - 1)
+            gt2c = np.clip(gt2, 0, n_alleles - 1)
+
+            a1 = np.where(gt1 >= 0, np.array(allele_row)[gt1c], "")
+            a2 = np.where(gt2 >= 0, np.array(allele_row)[gt2c], "")
+
+            missing = (gt1 < 0) | (gt2 < 0)
+            het     = ~missing & (a1 != a2)
+            # "~" for het, "-" for missing; "*" is reserved for spanning deletions in VCF
+            calls = np.where(
+                missing, "-",
+                np.where(het, "~", a1)
+            )
+
+            col_labels.append(f"{positions[vi]}")
+            col_arrays.append(calls)
+
+    return pd.DataFrame(
+        np.column_stack(col_arrays) if col_arrays else np.empty((len(sample_ids), 0), dtype=str),
+        index=sample_ids,
+        columns=col_labels,
+    )
