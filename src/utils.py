@@ -340,6 +340,7 @@ def build_allele_matrix(regions: dict) -> pd.DataFrame:
     """
     col_labels = []
     col_arrays = []
+    seen_positions: set[str] = set()
 
     sample_ids = None
 
@@ -372,7 +373,11 @@ def build_allele_matrix(regions: dict) -> pd.DataFrame:
                 np.where(het, "~", a1)
             )
 
-            col_labels.append(f"{positions[vi]}")
+            label = f"{positions[vi]}"
+            if label in seen_positions:
+                continue
+            seen_positions.add(label)
+            col_labels.append(label)
             col_arrays.append(calls)
 
     return pd.DataFrame(
