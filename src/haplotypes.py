@@ -43,7 +43,7 @@ def _build_ref_cds(gene_id: str, cds_gff: pd.DataFrame,
 
     chrom  = exons["seqid"].iloc[0]
     strand = exons["strand"].iloc[0]
-    exons  = exons.sort_values("start", ascending=(strand == "+"))
+    exons  = exons.sort_values("start", ascending=True)
 
     if chrom not in ref_genome:
         return None
@@ -61,8 +61,7 @@ def _genomic_to_cds_offset(genomic_pos: int, exons_sorted: pd.DataFrame,
         exon_start = int(exon["start"])
         exon_end   = int(exon["end"])
         if exon_start <= genomic_pos <= exon_end:
-            within = (genomic_pos - exon_start) if strand == "+" else (exon_end - genomic_pos)
-            return cds_offset + within
+            return cds_offset + (genomic_pos - exon_start)
         cds_offset += exon_end - exon_start + 1
     return None
 
@@ -169,7 +168,7 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
     ref_aa = _translate(ref_cds, strand)
 
     exons = cds_gff[cds_gff["gene_id"] == source_id].copy()
-    exons = exons.sort_values("start", ascending=(strand == "+"))
+    exons = exons.sort_values("start", ascending=True)
 
     # Map queried variant positions to 0-based CDS offsets
     pos_info = {}
@@ -181,10 +180,17 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
 
     sorted_pos_info = sorted(pos_info.items(), key=lambda x: x[1]["offset"])
 
-    # Reverse map: 1-based AA position → variant pos_strs whose codon it belongs to
+    # Reverse map: 1-based protein AA position → variant pos_strs whose codon it belongs to.
+    # For + strand the CDS offset directly gives the protein AA position.
+    # For - strand the CDS is assembled 5'→3' on the + strand and reverse-complemented
+    # before translation, so offset O maps to protein position (N-1-O)//3+1.
+    cds_len = len(ref_cds)
     aa_to_pos: dict[int, list[str]] = {}
     for pos_str, info in pos_info.items():
-        aa_pos = info["offset"] // 3 + 1
+        if strand == "+":
+            aa_pos = info["offset"] // 3 + 1
+        else:
+            aa_pos = (cds_len - 1 - info["offset"]) // 3 + 1
         aa_to_pos.setdefault(aa_pos, []).append(pos_str)
 
     haplotypes     = []
