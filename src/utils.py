@@ -157,19 +157,26 @@ def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
     return intervals
 
 
-def resolve_loci(loci_df: pd.DataFrame, cds_gff: pd.DataFrame) -> dict:
+def resolve_loci_with_notices(
+    loci_df: pd.DataFrame,
+    cds_gff: pd.DataFrame,
+) -> tuple[dict, tuple[str, ...]]:
     """
     Group loci by source identifier and resolve to genomic (NT) intervals.
 
     Returns:
-        {
-            source_id: {
-                "coord_type": "aa" | "nt",
-                "intervals":  [(chrom, start, end), ...]
-            }
-        }
+        (
+            {
+                source_id: {
+                    "coord_type": "aa" | "nt",
+                    "intervals":  [(chrom, start, end), ...]
+                }
+            },
+            (warning_message, ...),
+        )
     """
     resolved = {}
+    notices: list[str] = []
 
     for source_id, group in loci_df.groupby("chrom", sort=False):
         coord_type = group["coord_type"].iloc[0]
@@ -183,12 +190,20 @@ def resolve_loci(loci_df: pd.DataFrame, cds_gff: pd.DataFrame) -> dict:
                     source_id, int(row["start"]), int(row["end"]), cds_gff
                 )
                 if not aa_intervals:
-                    st.warning(f"Could not resolve AA positions {row['start']} - {row['end']} "
-                               f"for `{source_id}`")
+                    notices.append(
+                        f"Could not resolve AA positions {row['start']} - {row['end']} for `{source_id}`"
+                    )
                 intervals.extend(aa_intervals)
 
         resolved[source_id] = {"coord_type": coord_type, "intervals": intervals}
 
+    return resolved, tuple(notices)
+
+
+def resolve_loci(loci_df: pd.DataFrame, cds_gff: pd.DataFrame) -> dict:
+    resolved, notices = resolve_loci_with_notices(loci_df, cds_gff)
+    for notice in notices:
+        st.warning(notice)
     return resolved
 
 
@@ -260,8 +275,8 @@ def query_locus_metadata(_variant_data, _chunk_index_df,
         "filter_pass": ds["variant_filter_pass"].values,
         "CDS":         ds["variant_CDS"].values,
         "numalt":      ds["variant_numalt"].values,
-        "n_variants":  ds.dims["variants"],
-        "n_samples":   ds.dims["samples"],
+        "n_variants":  ds.sizes["variants"],
+        "n_samples":   ds.sizes["samples"],
     }
 
     return meta, ds
