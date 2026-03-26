@@ -6,7 +6,7 @@ import streamlit as st
 from src.utils import (
     build_chunk_index, load_reference_files, load_variant_data,
     parse_loci_from_input, resolve_loci, build_regions,
-    build_variant_rows, load_genotypes, load_allele_depths, build_allele_matrix,
+    build_variant_rows, load_call_data, build_allele_matrix,
 )
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
@@ -18,6 +18,8 @@ reference_files = load_reference_files()
 variant_data    = load_variant_data()
 
 # ── User input ────────────────────────────────────────────────────────────────
+st.title("Data Marketplace", text_alignment="center")
+
 DEBUG = st.toggle("Debug mode", value=False)
 
 RAW_USER_INPUT = st.text_input(
@@ -131,20 +133,20 @@ st.divider()
 st.subheader("Haplotypes")
 
 _HET_LABELS = {
-    "Don't compute haplotypes if het, and mark with asterisk": "exclude",
-    "Collapse het to hom using the major allele":     "major_ad",
-    "All alleles by depth":     "all_ad",
+    "Exclude and only use hom calls": "exclude",
+    "Use the major allele":           "major_ad"
 }
 het_mode_label = st.radio(
-    "Heterozygous call handling",
+    "How to handle heterozygous genotypes when computing haplotypes:",
     list(_HET_LABELS.keys()),
     horizontal=True,
 )
 HET_MODE = _HET_LABELS[het_mode_label]
 
+# Small state management section
 _load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE)
 if st.session_state.get("last_load_state") != _load_state:
-    st.session_state["last_load_state"] = _load_state
+    st.session_state["last_load_state"]   = _load_state
     st.session_state["haplotypes_loaded"] = False
 
 if not st.session_state.get("haplotypes_loaded"):
@@ -152,7 +154,16 @@ if not st.session_state.get("haplotypes_loaded"):
         st.session_state["haplotypes_loaded"] = True
         st.rerun()
 else:
-    st.caption(f"Haplotypes loaded · het mode: _{het_mode_label}_")
+    t0 = time.time()
+    with st.spinner(f"Loading genotypes for {n_samples:,} samples…"):
+        for region in regions.values():
+            region["genotypes"], region["g1_wins"] = load_call_data(region["ds"], load_ad=(HET_MODE == "major_ad"))
+    st.success(f"Loaded in {time.time() - t0:.1f}s")
+    
+
+
+
+
 
 # if not genotypes_loaded:
 #     st.info(f"Click below to retrieve haplotypes for {n_samples:,} samples across all loci.")
@@ -252,32 +263,3 @@ else:
 #             )
 #             st.subheader("Per-sample haplotypes")
 #             st.dataframe(per_sample, width="stretch", hide_index=True)
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# # Debug
-# # ══════════════════════════════════════════════════════════════════════════════
-# with st.expander("Debug"):
-#     if genotypes_loaded:
-#         allele_matrix_debug = build_allele_matrix(
-#             regions,
-#             excluded_positions=excluded_positions,
-#             het_mode=HET_MODE,
-#         )
-#         if "sample_to_id" in st.session_state:
-#             dm = allele_matrix_debug.copy()
-#             dm.insert(0, "combination_id", dm.index.map(st.session_state["sample_to_id"]))
-#         else:
-#             dm = allele_matrix_debug
-#         st.write("**Allele matrix (genotypes):**")
-#         st.dataframe(dm, width="stretch")
-
-#     if "haplotype_raw" in st.session_state:
-#         st.write("**Haplotype combinations (raw):**")
-#         st.dataframe(st.session_state["haplotype_raw"], width="stretch", hide_index=True)
-
-#     st.write("**Parsed loci:**")
-#     st.dataframe(loci_df, width="stretch", hide_index=True)
-#     st.write("**Resolved genomic intervals:**")
-#     for sid, info in resolved.items():
-#         st.text(f"{sid} ({info['coord_type']}): {info['intervals']}")

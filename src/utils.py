@@ -2,8 +2,11 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import xarray as xr
+import dask
 import malariagen_data
 import re
+
+_DASK_THREADS = 64  # network I/O is the bottleneck, not CPU — use many threads
 
 
 # ── Reference data ────────────────────────────────────────────────────────────
@@ -340,7 +343,7 @@ def build_regions(
             continue
 
         meta, ds = filtered
-        regions[source_id] = {"meta": meta, "ds": ds, "genotypes": None, "allele_depths": None}
+        regions[source_id] = {"meta": meta, "ds": ds, "genotypes": None, "g1_wins": None}
 
     return regions, warnings
 
@@ -369,30 +372,53 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
     return rows
 
 
-def load_genotypes(ds: xr.Dataset) -> np.ndarray:
-    return ds["call_genotype"].values.astype(np.int8)
+def load_call_data(ds: xr.Dataset, load_ad: bool = True) -> tuple[np.ndarray, np.ndarray | None]:
+    """
+    Load genotypes and, if requested and available, a precomputed allele-depth comparison.
 
+    Uses dask's threaded scheduler with a large thread pool to parallelise the many
+    small zarr chunk fetches (samples axis is chunked at 100, so 33k samples = 334
+    HTTP requests per variant).
 
-def load_allele_depths(ds: xr.Dataset) -> np.ndarray | None:
-    """Load allele depth (AD) field, returning None if unavailable."""
-    try:
-        return ds["call_AD"].values.astype(np.int32)
-    except (KeyError, AttributeError):
-        return None
+    Args:
+        load_ad: if False, skip AD entirely (saves ~half the network requests).
+
+    Returns:
+        genotypes: (n_variants, n_samples, 2) int8
+        g1_wins:   (n_variants, n_samples) bool — True where the first called allele
+                   has >= depth than the second. None if load_ad=False or AD unavailable.
+    """
+    opts = {"scheduler": "threads", "num_workers": _DASK_THREADS}
+
+    if not load_ad or "call_AD" not in ds:
+        (genotypes,) = dask.compute(ds["call_genotype"].data, **opts)
+        return genotypes.astype(np.int8), None
+
+    genotypes_raw, ad = dask.compute(ds["call_genotype"].data, ds["call_AD"].data, **opts)
+    genotypes = genotypes_raw.astype(np.int8)
+
+    n_v, n_s  = genotypes.shape[:2]
+    n_alleles = ad.shape[2]
+    vi = np.arange(n_v)[:, None]
+    si = np.arange(n_s)[None, :]
+    g1 = np.minimum(genotypes[:, :, 0].clip(0), n_alleles - 1)
+    g2 = np.minimum(genotypes[:, :, 1].clip(0), n_alleles - 1)
+
+    g1_wins = ad[vi, si, g1] >= ad[vi, si, g2]  # (n_variants, n_samples) bool
+    return genotypes, g1_wins
 
 
 def build_allele_matrix(
     regions: dict,
     excluded_positions: set[str] | None = None,
-    het_mode: str = "star",
+    het_mode: str = "exclude",
 ) -> pd.DataFrame:
     """
     Build a samples × positions DataFrame of called alleles.
 
     het_mode:
-      "star"     – het → "*", missing → "-"
-      "major_ad" – resolve het to the allele with highest allele depth
-      "all_ad"   – list all alleles comma-separated in descending depth order (e.g. "G,T")
+      "exclude"  – het → "*", missing → "-"
+      "major_ad" – resolve het to the allele with higher depth (requires g1_wins)
 
     excluded_positions: set of position strings to omit entirely.
     """
@@ -403,9 +429,9 @@ def build_allele_matrix(
     sample_ids = None
 
     for region in regions.values():
-        meta      = region["meta"]
-        genotypes = region["genotypes"]          # (n_variants, n_samples, 2)
-        ad        = region.get("allele_depths")  # (n_variants, n_samples, n_alleles) or None
+        meta     = region["meta"]
+        genotypes = region["genotypes"]   # (n_variants, n_samples, 2)
+        g1_wins   = region.get("g1_wins") # (n_variants, n_samples) bool, or None
         positions = meta["positions"]
 
         if sample_ids is None:
@@ -430,40 +456,8 @@ def build_allele_matrix(
             missing = (gt1 < 0) | (gt2 < 0)
             het     = ~missing & (a1 != a2)
 
-            if het_mode == "star" or ad is None:
-                calls = np.where(missing, "-", np.where(het, "*", a1))
-
-            elif het_mode == "major_ad":
-                ad_vi = ad[vi]  # (n_samples, n_alleles)
-                calls = np.empty(len(gt1), dtype=object)
-                for si in range(len(gt1)):
-                    if missing[si]:
-                        calls[si] = "-"
-                    elif not het[si]:
-                        calls[si] = a1[si]
-                    else:
-                        g1, g2 = int(gt1[si]), int(gt2[si])
-                        d1 = int(ad_vi[si, g1]) if g1 < ad_vi.shape[1] else 0
-                        d2 = int(ad_vi[si, g2]) if g2 < ad_vi.shape[1] else 0
-                        calls[si] = a1[si] if d1 >= d2 else a2[si]
-
-            elif het_mode == "all_ad":
-                ad_vi = ad[vi]
-                calls = np.empty(len(gt1), dtype=object)
-                for si in range(len(gt1)):
-                    if missing[si]:
-                        calls[si] = "-"
-                    elif not het[si]:
-                        calls[si] = a1[si]
-                    else:
-                        g1, g2 = int(gt1[si]), int(gt2[si])
-                        d1 = int(ad_vi[si, g1]) if g1 < ad_vi.shape[1] else 0
-                        d2 = int(ad_vi[si, g2]) if g2 < ad_vi.shape[1] else 0
-                        if d1 >= d2:
-                            calls[si] = f"{a1[si]},{a2[si]}"
-                        else:
-                            calls[si] = f"{a2[si]},{a1[si]}"
-
+            if het_mode == "major_ad" and g1_wins is not None:
+                calls = np.where(missing, "-", np.where(het, np.where(g1_wins[vi], a1, a2), a1))
             else:
                 calls = np.where(missing, "-", np.where(het, "*", a1))
 
