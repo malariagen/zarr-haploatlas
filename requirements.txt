@@ -1,5 +1,5 @@
-malariagen_data
-streamlit
+malariagen_data==15.6.0
+streamlit==1.54.0
 dask
 numpy
 pandas
