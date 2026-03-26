@@ -1,2 +1,6 @@
 malariagen_data
 streamlit
+dask
+numpy
+pandas
+xarray
