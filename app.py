@@ -144,7 +144,7 @@ het_mode_label = st.radio(
 HET_MODE = _HET_LABELS[het_mode_label]
 
 # Small state management section
-_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE)
+_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1)
 if st.session_state.get("last_load_state") != _load_state:
     st.session_state["last_load_state"]   = _load_state
     st.session_state["haplotypes_loaded"] = False
@@ -157,7 +157,7 @@ else:
     t0 = time.time()
     with st.spinner(f"Loading genotypes for {n_samples:,} samples…"):
         for region in regions.values():
-            region["genotypes"], region["g1_wins"] = load_call_data(region["ds"], load_ad=(HET_MODE == "major_ad"))
+            region["genotypes"], region["g1_wins"] = load_call_data(region["ds"])
     st.success(f"Loaded in {time.time() - t0:.1f}s")
     
 

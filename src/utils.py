@@ -2,11 +2,8 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import xarray as xr
-import dask
 import malariagen_data
 import re
-
-_DASK_THREADS = 64  # network I/O is the bottleneck, not CPU — use many threads
 
 
 # ── Reference data ────────────────────────────────────────────────────────────
@@ -372,35 +369,29 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
     return rows
 
 
-def load_call_data(ds: xr.Dataset, load_ad: bool = True) -> tuple[np.ndarray, np.ndarray | None]:
+def load_call_data(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray | None]:
     """
-    Load genotypes and, if requested and available, a precomputed allele-depth comparison.
-
-    Uses dask's threaded scheduler with a large thread pool to parallelise the many
-    small zarr chunk fetches (samples axis is chunked at 100, so 33k samples = 334
-    HTTP requests per variant).
-
-    Args:
-        load_ad: if False, skip AD entirely (saves ~half the network requests).
+    Load genotypes and, if available, a precomputed allele-depth comparison.
 
     Returns:
         genotypes: (n_variants, n_samples, 2) int8
         g1_wins:   (n_variants, n_samples) bool — True where the first called allele
-                   has >= depth than the second. None if load_ad=False or AD unavailable.
+                   has >= depth than the second. None if AD is unavailable.
+
+    Reducing AD to a single boolean per call avoids storing the full
+    (n_variants × n_samples × n_alleles) int32 array in memory.
     """
-    opts = {"scheduler": "threads", "num_workers": _DASK_THREADS}
+    genotypes = ds["call_genotype"].values.astype(np.int8)
 
-    if not load_ad or "call_AD" not in ds:
-        (genotypes,) = dask.compute(ds["call_genotype"].data, **opts)
-        return genotypes.astype(np.int8), None
+    try:
+        ad = ds["call_AD"].values  # (n_variants, n_samples, n_alleles)
+    except (KeyError, AttributeError):
+        return genotypes, None
 
-    genotypes_raw, ad = dask.compute(ds["call_genotype"].data, ds["call_AD"].data, **opts)
-    genotypes = genotypes_raw.astype(np.int8)
-
-    n_v, n_s  = genotypes.shape[:2]
-    n_alleles = ad.shape[2]
-    vi = np.arange(n_v)[:, None]
-    si = np.arange(n_s)[None, :]
+    n_v, n_s   = genotypes.shape[:2]
+    n_alleles  = ad.shape[2]
+    vi         = np.arange(n_v)[:, None]
+    si         = np.arange(n_s)[None, :]
     g1 = np.minimum(genotypes[:, :, 0].clip(0), n_alleles - 1)
     g2 = np.minimum(genotypes[:, :, 1].clip(0), n_alleles - 1)
 
