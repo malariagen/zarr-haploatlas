@@ -6,6 +6,8 @@ from Bio.Seq import Seq
 
 REF_FASTA = "assets/PlasmoDB-54_Pfalciparum3D7_Genome.fasta"
 
+HET_SYMBOL = "*"   # displayed in allele matrix and haplotype columns
+
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 
@@ -48,7 +50,6 @@ def _build_ref_cds(gene_id: str, cds_gff: pd.DataFrame,
     if chrom not in ref_genome:
         return None
 
-    # GFF is 1-based inclusive; Python slicing is 0-based exclusive
     cds_parts = [ref_genome[chrom][int(e["start"]) - 1 : int(e["end"])] for _, e in exons.iterrows()]
     return "".join(cds_parts), strand
 
@@ -83,8 +84,8 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
     sorted_pos_info: list of (pos_str, {"ref": str, "offset": int}) sorted by offset ascending.
     alleles_here:    {pos_str: observed_allele}
 
-    Spanning deletions (*) and het (~) are treated as reference.
-    Indels shift subsequent positions via a running offset (same logic as older.py).
+    Spanning deletions (*), het (*), multi-allele cells ("G,T"), and missing ("-")
+    are treated as reference. Indels shift subsequent positions via a running offset.
     """
     seq_chars      = list(ref_seq)
     running_offset = 0
@@ -93,15 +94,19 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
         observed = alleles_here.get(pos_str, info["ref"])
         ref_a    = info["ref"]
 
-        # Strip trailing '-' zarr padding from allele strings.
-        # "~" and "-" alone are our special markers (het / missing) — leave them untouched.
-        if observed not in ("~", "-"):
+        # Multi-allele cells from "all_ad" mode → treat as reference
+        if isinstance(observed, str) and "," in observed:
+            continue
+
+        # Strip trailing '-'/null padding; leave special markers untouched
+        if observed not in ("*", "-"):
             observed = observed.rstrip("-\x00")
         ref_a = ref_a.rstrip("-\x00")
 
         off = info["offset"] + running_offset
 
-        if observed in (ref_a, "*", "~", "-"):
+        # "*" covers both het and VCF spanning deletion — treat as reference
+        if observed in (ref_a, "*", "-"):
             continue
 
         ref_len = len(ref_a)
@@ -112,6 +117,20 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
     return "".join(seq_chars)
 
 
+def _aa_at(alt_aa: str, pos: int) -> str:
+    """Return amino acid at 1-based position, 'X' if beyond sequence (premature stop)."""
+    if pos < 1 or pos > len(alt_aa):
+        return "X"
+    return alt_aa[pos - 1]
+
+
+def _aa_slice(alt_aa: str, start: int, end: int) -> str:
+    """Return AA substring for 1-based inclusive [start, end], 'X' if truncated."""
+    if start < 1 or end > len(alt_aa):
+        return "X"
+    return alt_aa[start - 1 : end]
+
+
 # ── Haplotype computation ─────────────────────────────────────────────────────
 
 def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
@@ -120,22 +139,23 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
     """
     Compute haplotypes for each unique allele combination in `deduped`.
 
-    For AA loci, output covers only the user-queried AA positions (e.g. "SVMNK,F").
-    For NT loci, output covers each queried genomic interval independently (e.g. "G,ATTGTT").
-    Intervals within a locus are comma-separated in the output.
-
-    For each AA locus adds:
+    For AA loci adds:
       - {source_id}_haplotype  : queried AA sub-sequences joined by ","
-      - {source_id}_ns_changes : AA changes at queried positions vs reference (e.g. "C72S/I74M")
+      - {source_id}_ns_changes : AA changes vs reference
+      - {source_id}_{pos}      : per-queried-position AA column (single pos) or
+        {source_id}_{start}_{end} (range)
 
-    For each NT locus adds:
+    For NT loci adds:
       - {source_id}_haplotype  : queried NT sequences joined by ","
+      - {source_id}_{start}_{end} (or {source_id}_{pos}): per-interval NT column
 
     Variant handling:
-      - SNPs and indels   : applied with running-offset tracking
-      - Spanning del (*)  : treated as reference
-      - Het (~)           : treated as reference; locus flagged with "~" suffix
-      - Missing (-)       : whole locus result set to "-"
+      - SNPs / indels          : applied with running-offset tracking
+      - Spanning del (*) / het (*) : treated as reference; range flagged with "*"
+      - Multi-allele ("G,T")   : treated as reference for full haplotype; per-position
+                                  shows comma-separated translated AAs
+      - Missing (-)            : whole locus / range result set to "-"
+      - Stop codon (premature) : positions beyond the stop shown as "X"
     """
     ref_genome = load_ref_genome(ref_fasta_path)
     result     = deduped.copy()
@@ -159,6 +179,10 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
 
 # ── AA loci ───────────────────────────────────────────────────────────────────
 
+def _range_col_name(source_id: str, start: int, end: int) -> str:
+    return f"{source_id}_{start}" if start == end else f"{source_id}_{start}_{end}"
+
+
 def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
                        cds_gff, ref_genome):
     cds_result = _build_ref_cds(source_id, cds_gff, ref_genome)
@@ -180,10 +204,6 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
 
     sorted_pos_info = sorted(pos_info.items(), key=lambda x: x[1]["offset"])
 
-    # Reverse map: 1-based protein AA position → variant pos_strs whose codon it belongs to.
-    # For + strand the CDS offset directly gives the protein AA position.
-    # For - strand the CDS is assembled 5'→3' on the + strand and reverse-complemented
-    # before translation, so offset O maps to protein position (N-1-O)//3+1.
     cds_len = len(ref_cds)
     aa_to_pos: dict[int, list[str]] = {}
     for pos_str, info in pos_info.items():
@@ -192,6 +212,14 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
         else:
             aa_pos = (cds_len - 1 - info["offset"]) // 3 + 1
         aa_to_pos.setdefault(aa_pos, []).append(pos_str)
+
+    # One column per individual AA position across all queried ranges
+    all_aa_positions = sorted({
+        aa_pos
+        for aa_start, aa_end in aa_ranges
+        for aa_pos in range(aa_start, aa_end + 1)
+    })
+    per_pos_lists: dict[str, list] = {f"{source_id}_{p}": [] for p in all_aa_positions}
 
     haplotypes     = []
     ns_changes_col = []
@@ -206,47 +234,77 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
         ns_list   = []
 
         for aa_start, aa_end in aa_ranges:
-            # Per-range status: check variants whose codon falls in this range
-            range_variants = [
-                alleles_here.get(p)
-                for aa_pos in range(aa_start, aa_end + 1)
-                for p in aa_to_pos.get(aa_pos, [])
-            ]
-            range_has_missing = "-" in range_variants
-            range_has_het     = "~" in range_variants
+            range_pos     = [p for aa_p in range(aa_start, aa_end + 1)
+                             for p in aa_to_pos.get(aa_p, [])]
+            range_alleles = [alleles_here.get(p) for p in range_pos]
 
-            if range_has_missing:
+            has_missing = "-" in range_alleles
+            has_het     = HET_SYMBOL in range_alleles
+            has_multi   = any(isinstance(v, str) and "," in v for v in range_alleles)
+
+            if has_missing:
                 hap_parts.append("-")
-            elif range_has_het:
-                hap_parts.append("~")
+            elif has_het:
+                hap_parts.append(HET_SYMBOL)
+            elif has_multi:
+                hap_parts.append(HET_SYMBOL)
             else:
-                ref_slice = ref_aa[aa_start - 1 : aa_end] if len(ref_aa) >= aa_end else ""
-                alt_slice = alt_aa[aa_start - 1 : aa_end] if len(alt_aa) >= aa_end else ""
-                if not ref_slice or len(ref_slice) != len(alt_slice):
-                    hap_parts.append("!")
-                else:
-                    hap_parts.append(alt_slice)
+                hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end)
+                                  if aa_start != aa_end else _aa_at(alt_aa, aa_start))
 
-            # Per-AA-position ns_changes entries
+            # ns_changes for each individual AA position in this range
             for aa_pos in range(aa_start, aa_end + 1):
-                codon_variants = aa_to_pos.get(aa_pos, [])
-                is_missing = any(alleles_here.get(p) == "-" for p in codon_variants)
-                is_het     = any(alleles_here.get(p) == "~" for p in codon_variants)
+                codon_vars = aa_to_pos.get(aa_pos, [])
+                is_missing = any(alleles_here.get(p) == "-" for p in codon_vars)
+                is_het     = any(alleles_here.get(p) == HET_SYMBOL for p in codon_vars)
                 ref_a = ref_aa[aa_pos - 1] if len(ref_aa) >= aa_pos else "?"
-                alt_a = alt_aa[aa_pos - 1] if len(alt_aa) >= aa_pos else "?"
+                alt_a = _aa_at(alt_aa, aa_pos)
 
                 if is_missing:
                     ns_list.append(f"{ref_a}{aa_pos}-")
                 elif is_het:
-                    ns_list.append(f"{ref_a}{aa_pos}~")
+                    ns_list.append(f"{ref_a}{aa_pos}{HET_SYMBOL}")
                 elif ref_a != alt_a:
                     ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
+
+        # Per-individual-position columns
+        for aa_pos in all_aa_positions:
+            col_name   = f"{source_id}_{aa_pos}"
+            codon_vars = aa_to_pos.get(aa_pos, [])
+            pos_alleles = [alleles_here.get(p) for p in codon_vars]
+
+            has_missing = "-" in pos_alleles
+            has_het     = HET_SYMBOL in pos_alleles
+            has_multi   = any(isinstance(v, str) and "," in v for v in pos_alleles)
+
+            if has_missing:
+                per_pos_lists[col_name].append("-")
+            elif has_het:
+                per_pos_lists[col_name].append(HET_SYMBOL)
+            elif has_multi:
+                multi_vars = {p: v for p in codon_vars
+                              if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
+                n_opts = max(len(v.split(",")) for v in multi_vars.values())
+                aa_opts = []
+                for idx in range(n_opts):
+                    test = dict(alleles_here)
+                    for p, v in multi_vars.items():
+                        opts = v.split(",")
+                        test[p] = opts[idx] if idx < len(opts) else opts[-1]
+                    alt_cds_t = _apply_variants(ref_cds, sorted_pos_info, test)
+                    alt_aa_t  = _translate(alt_cds_t, strand)
+                    aa_opts.append(_aa_at(alt_aa_t, aa_pos))
+                per_pos_lists[col_name].append(",".join(aa_opts))
+            else:
+                per_pos_lists[col_name].append(_aa_at(alt_aa, aa_pos))
 
         haplotypes.append(",".join(hap_parts))
         ns_changes_col.append(str(ns_list))
 
     result[f"{source_id}_haplotype"]  = haplotypes
     result[f"{source_id}_ns_changes"] = ns_changes_col
+    for col_name, values in per_pos_lists.items():
+        result[col_name] = values
 
 
 # ── NT loci ───────────────────────────────────────────────────────────────────
@@ -254,7 +312,7 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
 def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
                        intervals, ref_genome):
     # Build per-interval pos_info with offsets local to each interval
-    interval_pos_infos = []   # one entry per interval: sorted list of (pos_str, {ref, offset})
+    interval_pos_infos = []
 
     for chrom, iv_start, iv_end in intervals:
         if chrom not in ref_genome:
@@ -267,12 +325,25 @@ def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
             if iv_start <= gpos <= iv_end:
                 local_pos_info[str(pos)] = {
                     "ref":    str(meta["alleles"][vi][0]),
-                    "offset": gpos - iv_start,   # 0-based offset within this interval
+                    "offset": gpos - iv_start,
                 }
 
         interval_pos_infos.append(
             sorted(local_pos_info.items(), key=lambda x: x[1]["offset"])
         )
+
+    # Per-interval column names (align with nt_ranges if available, else use intervals)
+    range_source = nt_ranges if nt_ranges else [(iv[1], iv[2]) for iv in intervals]
+    interval_col_names = [
+        _range_col_name(source_id, s, e) for s, e in range_source
+    ]
+    # Pad/trim to match number of intervals
+    while len(interval_col_names) < len(intervals):
+        iv = intervals[len(interval_col_names)]
+        interval_col_names.append(_range_col_name(source_id, iv[1], iv[2]))
+    interval_col_names = interval_col_names[:len(intervals)]
+
+    per_iv_lists: dict[str, list] = {cn: [] for cn in interval_col_names}
 
     haplotypes = []
 
@@ -280,19 +351,25 @@ def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
         all_pos = {p for infos in interval_pos_infos for p, _ in infos}
         alleles_here = {p: row[p] for p in all_pos if p in deduped.columns}
         has_missing  = any(v == "-" for v in alleles_here.values())
-        has_het      = any(v == "~" for v in alleles_here.values())
+        has_het      = any(v == HET_SYMBOL for v in alleles_here.values())
 
         if has_missing:
             haplotypes.append("-")
+            for cn in interval_col_names:
+                per_iv_lists[cn].append("-")
             continue
 
         parts = []
-        for (chrom, iv_start, iv_end), sorted_pos_info in zip(intervals, interval_pos_infos):
+        for (chrom, iv_start, iv_end), sorted_pos_info, col_name in zip(
+                intervals, interval_pos_infos, interval_col_names):
             ref_iv  = ref_genome[chrom][iv_start - 1 : iv_end]
             alt_seq = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
             parts.append(alt_seq)
+            per_iv_lists[col_name].append(alt_seq)
 
-        suffix = "~" if has_het else ""
+        suffix = HET_SYMBOL if has_het else ""
         haplotypes.append(",".join(parts) + suffix)
 
     result[f"{source_id}_haplotype"] = haplotypes
+    for col_name, values in per_iv_lists.items():
+        result[col_name] = values

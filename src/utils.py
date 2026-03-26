@@ -331,31 +331,51 @@ def load_genotypes(ds: xr.Dataset) -> np.ndarray:
     return ds["call_genotype"].values.astype(np.int8)
 
 
-def build_allele_matrix(regions: dict) -> pd.DataFrame:
+def load_allele_depths(ds: xr.Dataset) -> np.ndarray | None:
+    """Load allele depth (AD) field, returning None if unavailable."""
+    try:
+        return ds["call_AD"].values.astype(np.int32)
+    except (KeyError, AttributeError):
+        return None
+
+
+def build_allele_matrix(
+    regions: dict,
+    excluded_positions: set[str] | None = None,
+    het_mode: str = "star",
+) -> pd.DataFrame:
     """
     Build a samples × positions DataFrame of called alleles.
 
-    Columns are labelled "chrom:pos". Cells show the allele string:
-    homozygous → single allele, heterozygous → "A/T", missing → ".".
-    """
-    col_labels = []
-    col_arrays = []
-    seen_positions: set[str] = set()
+    het_mode:
+      "star"     – het → "*", missing → "-"
+      "major_ad" – resolve het to the allele with highest allele depth
+      "all_ad"   – list all alleles comma-separated in descending depth order (e.g. "G,T")
 
+    excluded_positions: set of position strings to omit entirely.
+    """
+    excluded_positions = excluded_positions or set()
+    col_labels: list[str] = []
+    col_arrays: list      = []
+    seen_positions: set[str] = set()
     sample_ids = None
 
     for region in regions.values():
         meta      = region["meta"]
-        genotypes = region["genotypes"]   # (n_variants, n_samples, 2)
+        genotypes = region["genotypes"]          # (n_variants, n_samples, 2)
+        ad        = region.get("allele_depths")  # (n_variants, n_samples, n_alleles) or None
         positions = meta["positions"]
 
         if sample_ids is None:
             sample_ids = meta["sample_ids"]
 
         for vi in range(meta["n_variants"]):
-            gt1 = genotypes[vi, :, 0]   # (n_samples,)
-            gt2 = genotypes[vi, :, 1]
+            label = str(positions[vi])
+            if label in seen_positions or label in excluded_positions:
+                continue
 
+            gt1 = genotypes[vi, :, 0]
+            gt2 = genotypes[vi, :, 1]
             allele_row = meta["alleles"][vi]
             n_alleles  = allele_row.shape[0]
 
@@ -367,21 +387,55 @@ def build_allele_matrix(regions: dict) -> pd.DataFrame:
 
             missing = (gt1 < 0) | (gt2 < 0)
             het     = ~missing & (a1 != a2)
-            # "~" for het, "-" for missing; "*" is reserved for spanning deletions in VCF
-            calls = np.where(
-                missing, "-",
-                np.where(het, "~", a1)
-            )
 
-            label = f"{positions[vi]}"
-            if label in seen_positions:
-                continue
+            if het_mode == "star" or ad is None:
+                calls = np.where(missing, "-", np.where(het, "*", a1))
+
+            elif het_mode == "major_ad":
+                ad_vi = ad[vi]  # (n_samples, n_alleles)
+                calls = np.empty(len(gt1), dtype=object)
+                for si in range(len(gt1)):
+                    if missing[si]:
+                        calls[si] = "-"
+                    elif not het[si]:
+                        calls[si] = a1[si]
+                    else:
+                        g1, g2 = int(gt1[si]), int(gt2[si])
+                        d1 = int(ad_vi[si, g1]) if g1 < ad_vi.shape[1] else 0
+                        d2 = int(ad_vi[si, g2]) if g2 < ad_vi.shape[1] else 0
+                        calls[si] = a1[si] if d1 >= d2 else a2[si]
+
+            elif het_mode == "all_ad":
+                ad_vi = ad[vi]
+                calls = np.empty(len(gt1), dtype=object)
+                for si in range(len(gt1)):
+                    if missing[si]:
+                        calls[si] = "-"
+                    elif not het[si]:
+                        calls[si] = a1[si]
+                    else:
+                        g1, g2 = int(gt1[si]), int(gt2[si])
+                        d1 = int(ad_vi[si, g1]) if g1 < ad_vi.shape[1] else 0
+                        d2 = int(ad_vi[si, g2]) if g2 < ad_vi.shape[1] else 0
+                        if d1 >= d2:
+                            calls[si] = f"{a1[si]},{a2[si]}"
+                        else:
+                            calls[si] = f"{a2[si]},{a1[si]}"
+
+            else:
+                calls = np.where(missing, "-", np.where(het, "*", a1))
+
             seen_positions.add(label)
             col_labels.append(label)
-            col_arrays.append(calls)
+            col_arrays.append(np.asarray(calls, dtype=object))
 
+    if not col_arrays:
+        return pd.DataFrame(
+            np.empty((len(sample_ids), 0), dtype=object),
+            index=sample_ids, columns=[],
+        )
     return pd.DataFrame(
-        np.column_stack(col_arrays) if col_arrays else np.empty((len(sample_ids), 0), dtype=str),
+        np.column_stack(col_arrays),
         index=sample_ids,
         columns=col_labels,
     )
