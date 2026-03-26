@@ -157,23 +157,15 @@ def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
     return intervals
 
 
-def resolve_loci_with_notices(
+def resolve_loci(
     loci_df: pd.DataFrame,
     cds_gff: pd.DataFrame,
-) -> tuple[dict, tuple[str, ...]]:
+    verbose: bool = False,
+) -> dict | tuple[dict, tuple[str, ...]]:
     """
-    Group loci by source identifier and resolve to genomic (NT) intervals.
+    Resolve loci to genomic intervals.
 
-    Returns:
-        (
-            {
-                source_id: {
-                    "coord_type": "aa" | "nt",
-                    "intervals":  [(chrom, start, end), ...]
-                }
-            },
-            (warning_message, ...),
-        )
+    If verbose is True, print notices for unresolved AA ranges.
     """
     resolved = {}
     notices: list[str] = []
@@ -197,13 +189,9 @@ def resolve_loci_with_notices(
 
         resolved[source_id] = {"coord_type": coord_type, "intervals": intervals}
 
-    return resolved, tuple(notices)
-
-
-def resolve_loci(loci_df: pd.DataFrame, cds_gff: pd.DataFrame) -> dict:
-    resolved, notices = resolve_loci_with_notices(loci_df, cds_gff)
-    for notice in notices:
-        st.warning(notice)
+    if verbose:
+        for notice in notices:
+            print(notice)
     return resolved
 
 
@@ -316,6 +304,45 @@ def filter_region_by_intervals(meta: dict, ds: xr.Dataset,
         "n_samples":   meta["n_samples"],
     }
     return filtered_meta, ds.isel(variants=keep_idx)
+
+@st.cache_data(show_spinner = False)
+def build_regions(
+    resolved_loci: dict,
+    _variant_data,
+    chunk_index_df: pd.DataFrame,
+    upstream_pad: int = 100,
+) -> tuple[dict, list[str]]:
+    """
+    Query variant data for each resolved locus.
+
+    Returns:
+        regions:  dict mapping source_id → {"meta", "ds", "genotypes", "allele_depths"}
+        warnings: list of human-readable warning strings for failed/empty loci
+    """
+    regions: dict = {}
+    warnings: list[str] = []
+
+    for source_id, locus_info in resolved_loci.items():
+        intervals = locus_info["intervals"]
+        if not intervals:
+            warnings.append(f"No genomic intervals resolved for `{source_id}`")
+            continue
+
+        padded = tuple((c, max(1, s - upstream_pad), e) for c, s, e in intervals)
+        result = query_locus_metadata(_variant_data, chunk_index_df, padded)
+        if result is None:
+            warnings.append(f"No variants found for `{source_id}`")
+            continue
+
+        filtered = filter_region_by_intervals(*result, intervals)
+        if filtered is None:
+            warnings.append(f"No variants found for `{source_id}`")
+            continue
+
+        meta, ds = filtered
+        regions[source_id] = {"meta": meta, "ds": ds, "genotypes": None, "allele_depths": None}
+
+    return regions, warnings
 
 
 def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dict]:
