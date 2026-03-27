@@ -14,11 +14,9 @@ from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
 
 def _make_per_sample_tsv(raw: pd.DataFrame) -> str:
-    # Drop raw allele-matrix position columns (all-digit names) — only keep
-    # haplotype summary columns to avoid exploding memory on large queries.
-    pos_cols = [c for c in raw.columns if str(c).isdigit()]
+    # Position columns are already stripped before storing in session state.
     return (
-        raw.drop(columns=pos_cols)
+        raw
         .explode("sample_ids")
         .rename(columns={"sample_ids": "sample_id"})
         .drop(columns=["n_samples"])
@@ -282,6 +280,9 @@ else:
         deduped = deduplicate_allele_matrix(allele_matrix)
         allele_matrix = None
 
+        if _save_intermediates:
+            st.session_state["_debug_deduped"] = deduped
+
         progress.progress((n_regions + 1) / n_steps, text="Computing haplotypes…")
         raw = compute_haplotypes(
             deduped, regions, resolved_loci, parsed_loci,
@@ -290,9 +291,14 @@ else:
         progress.progress(1.0, text="Done!")
         progress.empty()
 
-        st.session_state["haplotypes_raw"]    = raw
-        st.session_state["_debug_deduped"]    = deduped
-        st.session_state["_hap_elapsed"]      = time.time() - t0
+        # Drop raw position columns before caching — they duplicate deduped content
+        # and are not needed for display or download.
+        _pos_cols = [c for c in raw.columns if str(c).isdigit()]
+        raw = raw.drop(columns=_pos_cols)
+        deduped = None  # free before storing
+
+        st.session_state["haplotypes_raw"] = raw
+        st.session_state["_hap_elapsed"]   = time.time() - t0
 
     raw     = st.session_state["haplotypes_raw"]
     deduped = st.session_state.get("_debug_deduped")
