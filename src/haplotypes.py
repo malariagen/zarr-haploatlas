@@ -158,8 +158,9 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
       - Missing (-)            : whole locus / range result set to "-"
       - Stop codon (premature) : positions beyond the stop shown as "X"
     """
-    ref_genome = load_ref_genome(ref_fasta_path)
-    result     = deduped.copy()
+    ref_genome  = load_ref_genome(ref_fasta_path)
+    result      = deduped.copy()
+    new_col_dfs = []
 
     for source_id, locus_info in resolved.items():
         region = regions.get(source_id)
@@ -169,11 +170,17 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
         query_ranges = loci_df[loci_df["chrom"] == source_id][["start", "end"]].values.tolist()
 
         if locus_info["coord_type"] == "aa":
-            _add_aa_haplotypes(result, deduped, source_id, region["meta"],
-                               query_ranges, cds_gff, ref_genome)
+            cols = _add_aa_haplotypes(deduped, source_id, region["meta"],
+                                      query_ranges, cds_gff, ref_genome)
         else:
-            _add_nt_haplotypes(result, deduped, source_id, region["meta"],
-                               query_ranges, locus_info["intervals"], ref_genome)
+            cols = _add_nt_haplotypes(deduped, source_id, region["meta"],
+                                      query_ranges, locus_info["intervals"], ref_genome)
+
+        if cols:
+            new_col_dfs.append(pd.DataFrame(cols, index=result.index))
+
+    if new_col_dfs:
+        result = pd.concat([result] + new_col_dfs, axis=1)
 
     return result
 
@@ -184,11 +191,11 @@ def _range_col_name(source_id: str, start: int, end: int) -> str:
     return f"{source_id}_{start}" if start == end else f"{source_id}_{start}_{end}"
 
 
-def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
-                       cds_gff, ref_genome):
+def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
+                       cds_gff, ref_genome) -> dict:
     cds_result = _build_ref_cds(source_id, cds_gff, ref_genome)
     if cds_result is None:
-        return
+        return {}
     ref_cds, strand = cds_result
     ref_aa = _translate(ref_cds, strand)
 
@@ -331,16 +338,17 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
         haplotypes.append(",".join(hap_parts))
         ns_changes_col.append(str(ns_list))
 
-    result[f"{source_id}_haplotype"]  = haplotypes
-    result[f"{source_id}_ns_changes"] = ns_changes_col
-    for col_name, values in per_pos_lists.items():
-        result[col_name] = values
+    return {
+        f"{source_id}_haplotype":  haplotypes,
+        f"{source_id}_ns_changes": ns_changes_col,
+        **per_pos_lists,
+    }
 
 
 # ── NT loci ───────────────────────────────────────────────────────────────────
 
-def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
-                       intervals, ref_genome):
+def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
+                       intervals, ref_genome) -> dict:
     # Build per-interval pos_info with offsets local to each interval
     interval_pos_infos = []
 
@@ -417,6 +425,7 @@ def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
         suffix = HET_SYMBOL if has_het else ""
         haplotypes.append(",".join(parts) + suffix)
 
-    result[f"{source_id}_haplotype"] = haplotypes
-    for col_name, values in per_iv_lists.items():
-        result[col_name] = values
+    return {
+        f"{source_id}_haplotype": haplotypes,
+        **per_iv_lists,
+    }
