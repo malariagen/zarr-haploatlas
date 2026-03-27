@@ -136,7 +136,8 @@ def _aa_slice(alt_aa: str, start: int, end: int) -> str:
 
 def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
                        loci_df: pd.DataFrame, cds_gff: pd.DataFrame,
-                       ref_fasta_path: str = REF_FASTA) -> pd.DataFrame:
+                       ref_fasta_path: str = REF_FASTA,
+                       het_sep: str = "/") -> pd.DataFrame:
     """
     Compute haplotypes for each unique allele combination in `deduped`.
 
@@ -162,19 +163,30 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
     result      = deduped.copy()
     new_col_dfs = []
 
+    # Build alias map: source_id → display prefix
+    alias_map: dict[str, str] = {}
+    if "alias" in loci_df.columns:
+        for chrom, grp in loci_df.groupby("chrom", sort=False):
+            a = grp["alias"].dropna()
+            if not a.empty:
+                alias_map[chrom] = a.iloc[0]
+
     for source_id, locus_info in resolved.items():
         region = regions.get(source_id)
         if region is None:
             continue
 
         query_ranges = loci_df[loci_df["chrom"] == source_id][["start", "end"]].values.tolist()
+        prefix = alias_map.get(source_id, source_id)
 
         if locus_info["coord_type"] == "aa":
             cols = _add_aa_haplotypes(deduped, source_id, region["meta"],
-                                      query_ranges, cds_gff, ref_genome)
+                                      query_ranges, cds_gff, ref_genome,
+                                      het_sep=het_sep, prefix=prefix)
         else:
             cols = _add_nt_haplotypes(deduped, source_id, region["meta"],
-                                      query_ranges, locus_info["intervals"], ref_genome)
+                                      query_ranges, locus_info["intervals"], ref_genome,
+                                      het_sep=het_sep, prefix=prefix)
 
         if cols:
             new_col_dfs.append(pd.DataFrame(cols, index=result.index))
@@ -192,7 +204,8 @@ def _range_col_name(source_id: str, start: int, end: int) -> str:
 
 
 def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
-                       cds_gff, ref_genome) -> dict:
+                       cds_gff, ref_genome, het_sep: str = "/",
+                       prefix: str | None = None) -> dict:
     cds_result = _build_ref_cds(source_id, cds_gff, ref_genome)
     if cds_result is None:
         return {}
@@ -221,13 +234,15 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             aa_pos = (cds_len - 1 - info["offset"]) // 3 + 1
         aa_to_pos.setdefault(aa_pos, []).append(pos_str)
 
+    col_prefix = prefix if prefix else source_id
+
     # One column per individual AA position across all queried ranges
     all_aa_positions = sorted({
         aa_pos
         for aa_start, aa_end in aa_ranges
         for aa_pos in range(aa_start, aa_end + 1)
     })
-    per_pos_lists: dict[str, list] = {f"{source_id}_{p}": [] for p in all_aa_positions}
+    per_pos_lists: dict[str, list] = {f"{col_prefix}_{p}": [] for p in all_aa_positions}
 
     haplotypes     = []
     ns_changes_col = []
@@ -235,20 +250,21 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
     for _, row in deduped.iterrows():
         alleles_here = {p: row[p] for p in pos_info if p in deduped.columns}
 
-        # ordered_ad positions hold "major/minor" nucleotide pairs — pre-compute
+        # ordered_ad positions hold "major{sep}minor" nucleotide pairs — pre-compute
         # separate major/minor translations so per-position columns can show "S/A".
-        ordered_pos = {p for p, v in alleles_here.items() if isinstance(v, str) and "/" in v}
+        ordered_pos = {p for p, v in alleles_here.items()
+                       if isinstance(v, str) and het_sep in v}
         if ordered_pos:
-            alleles_major = {p: v.split("/")[0] if p in ordered_pos else v
+            alleles_major = {p: v.split(het_sep)[0] if p in ordered_pos else v
                              for p, v in alleles_here.items()}
-            alleles_minor = {p: v.split("/")[1] if p in ordered_pos else v
+            alleles_minor = {p: v.split(het_sep)[1] if p in ordered_pos else v
                              for p, v in alleles_here.items()}
             alt_aa_major = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_major), strand)
             alt_aa_minor = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_minor), strand)
         else:
             alt_aa_major = alt_aa_minor = None
 
-        # "/" alleles are treated as reference by _apply_variants (same as "," alleles)
+        # het_sep alleles are treated as reference by _apply_variants
         alt_cds = _apply_variants(ref_cds, sorted_pos_info, alleles_here)
         alt_aa  = _translate(alt_cds, strand)
 
@@ -266,7 +282,15 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             has_ordered  = any(p in ordered_pos for p in range_pos)
 
             if has_missing:
-                hap_parts.append("-")
+                # Show per-position: "-" for missing positions, actual AA for present ones
+                chars = []
+                for aa_p in range(aa_start, aa_end + 1):
+                    cvars = aa_to_pos.get(aa_p, [])
+                    if any(alleles_here.get(p) == "-" for p in cvars):
+                        chars.append("-")
+                    else:
+                        chars.append(_aa_at(alt_aa, aa_p))
+                hap_parts.append("".join(chars))
             elif has_het or has_ordered or has_multi:
                 # ordered/het ranges collapse to "*" in the haplotype summary;
                 # per-position columns still show the "S/A" breakdown.
@@ -295,13 +319,13 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                         if aa_m != ref_a:
                             ns_list.append(f"{ref_a}{aa_pos}{aa_m}")
                     else:
-                        ns_list.append(f"{ref_a}{aa_pos}{aa_m}/{aa_n}")
+                        ns_list.append(f"{ref_a}{aa_pos}{aa_m}{het_sep}{aa_n}")
                 elif ref_a != alt_a:
                     ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
 
         # Per-individual-position columns
         for aa_pos in all_aa_positions:
-            col_name    = f"{source_id}_{aa_pos}"
+            col_name    = f"{col_prefix}_{aa_pos}"
             codon_vars  = aa_to_pos.get(aa_pos, [])
             pos_alleles = [alleles_here.get(p) for p in codon_vars]
 
@@ -317,7 +341,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             elif is_ordered:
                 aa_m = _aa_at(alt_aa_major, aa_pos)
                 aa_n = _aa_at(alt_aa_minor, aa_pos)
-                per_pos_lists[col_name].append(f"{aa_m}/{aa_n}" if aa_m != aa_n else aa_m)
+                per_pos_lists[col_name].append(f"{aa_m}{het_sep}{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
                               if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
@@ -336,11 +360,11 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                 per_pos_lists[col_name].append(_aa_at(alt_aa, aa_pos))
 
         haplotypes.append(",".join(hap_parts))
-        ns_changes_col.append(str(ns_list))
+        ns_changes_col.append(ns_list)  # store as actual list, not str
 
     return {
-        f"{source_id}_haplotype":  haplotypes,
-        f"{source_id}_ns_changes": ns_changes_col,
+        f"{col_prefix}_haplotype":  haplotypes,
+        f"{col_prefix}_ns_changes": ns_changes_col,
         **per_pos_lists,
     }
 
@@ -348,7 +372,8 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
 # ── NT loci ───────────────────────────────────────────────────────────────────
 
 def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
-                       intervals, ref_genome) -> dict:
+                       intervals, ref_genome, het_sep: str = "/",
+                       prefix: str | None = None) -> dict:
     # Build per-interval pos_info with offsets local to each interval
     interval_pos_infos = []
 
@@ -370,15 +395,17 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
             sorted(local_pos_info.items(), key=lambda x: x[1]["offset"])
         )
 
+    col_prefix = prefix if prefix else source_id
+
     # Per-interval column names (align with nt_ranges if available, else use intervals)
     range_source = nt_ranges if nt_ranges else [(iv[1], iv[2]) for iv in intervals]
     interval_col_names = [
-        _range_col_name(source_id, s, e) for s, e in range_source
+        _range_col_name(col_prefix, s, e) for s, e in range_source
     ]
     # Pad/trim to match number of intervals
     while len(interval_col_names) < len(intervals):
         iv = intervals[len(interval_col_names)]
-        interval_col_names.append(_range_col_name(source_id, iv[1], iv[2]))
+        interval_col_names.append(_range_col_name(col_prefix, iv[1], iv[2]))
     interval_col_names = interval_col_names[:len(intervals)]
 
     per_iv_lists: dict[str, list] = {cn: [] for cn in interval_col_names}
@@ -397,12 +424,13 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
                 per_iv_lists[cn].append("-")
             continue
 
-        # ordered_ad positions hold "major/minor" nucleotide pairs
-        ordered_pos = {p for p, v in alleles_here.items() if isinstance(v, str) and "/" in v}
+        # ordered_ad positions hold "major{sep}minor" nucleotide pairs
+        ordered_pos = {p for p, v in alleles_here.items()
+                       if isinstance(v, str) and het_sep in v}
         if ordered_pos:
-            alleles_major = {p: v.split("/")[0] if p in ordered_pos else v
+            alleles_major = {p: v.split(het_sep)[0] if p in ordered_pos else v
                              for p, v in alleles_here.items()}
-            alleles_minor = {p: v.split("/")[1] if p in ordered_pos else v
+            alleles_minor = {p: v.split(het_sep)[1] if p in ordered_pos else v
                              for p, v in alleles_here.items()}
 
         parts = []
@@ -415,7 +443,7 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
             if iv_ordered:
                 alt_major = _apply_variants(ref_iv, sorted_pos_info, alleles_major)
                 alt_minor = _apply_variants(ref_iv, sorted_pos_info, alleles_minor)
-                alt_seq   = f"{alt_major}/{alt_minor}" if alt_major != alt_minor else alt_major
+                alt_seq   = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
             else:
                 alt_seq = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
 
@@ -426,6 +454,6 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
         haplotypes.append(",".join(parts) + suffix)
 
     return {
-        f"{source_id}_haplotype": haplotypes,
+        f"{col_prefix}_haplotype": haplotypes,
         **per_iv_lists,
     }

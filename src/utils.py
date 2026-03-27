@@ -88,13 +88,16 @@ def build_chunk_index() -> pd.DataFrame:
 # ── Locus parsing & resolution ────────────────────────────────────────────────
 
 def parse_loci_from_input(user_input: str) -> pd.DataFrame:
-    # Match IDENTIFIER[...] tokens; [...] may contain spaces after commas.
-    # Using a non-whitespace identifier followed by a bracket group lets us
-    # tolerate any number of spaces between loci without splitting inside brackets.
-    tokens = re.findall(r'([^\s\[]+\[[^\]]+\])', user_input)
+    # Match IDENTIFIER[...] tokens with optional (alias) suffix.
+    tokens = re.findall(r'([^\s\[]+\[[^\]]+\](?:\([^)]+\))?)', user_input)
     rows = []
     for token in tokens:
-        identifier, pos_part = token.split("[", 1)
+        # Extract optional alias like (crt)
+        alias_match = re.search(r'\(([^)]+)\)$', token)
+        alias = alias_match.group(1) if alias_match else None
+        token_body = token[:alias_match.start()].strip() if alias_match else token
+
+        identifier, pos_part = token_body.split("[", 1)
         pos_part = pos_part.rstrip("]")
 
         is_gene    = bool(re.match(r"^PF3D7_\d{7}$", identifier, re.IGNORECASE))
@@ -106,12 +109,12 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
                 continue
             if "-" in part:
                 start, end = part.split("-", 1)
-                rows.append((identifier, int(start.strip()), int(end.strip()), coord_type))
+                rows.append((identifier, int(start.strip()), int(end.strip()), coord_type, alias))
             else:
                 pos = int(part)
-                rows.append((identifier, pos, pos, coord_type))
+                rows.append((identifier, pos, pos, coord_type, alias))
 
-    return pd.DataFrame(rows, columns=["chrom", "start", "end", "coord_type"])
+    return pd.DataFrame(rows, columns=["chrom", "start", "end", "coord_type", "alias"])
 
 
 def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
@@ -415,6 +418,7 @@ def build_allele_matrix(
     regions: dict,
     excluded_positions: set[str] | None = None,
     het_mode: str = "exclude",
+    het_sep: str = "/",
 ) -> pd.DataFrame:
     """
     Build a samples × positions DataFrame of called alleles.
@@ -465,7 +469,7 @@ def build_allele_matrix(
                 # "major/minor" ordered by allele depth
                 major   = np.where(g1_wins[vi], a1, a2)
                 minor   = np.where(g1_wins[vi], a2, a1)
-                ordered = np.array([f"{m}/{n}" for m, n in zip(major, minor)], dtype=object)
+                ordered = np.array([f"{m}{het_sep}{n}" for m, n in zip(major, minor)], dtype=object)
                 calls   = np.where(missing, "-", np.where(het, ordered, a1))
             else:
                 calls = np.where(missing, "-", np.where(het, "*", a1))

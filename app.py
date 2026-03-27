@@ -1,3 +1,4 @@
+import ast
 import time
 import pandas as pd
 import numpy as np
@@ -11,19 +12,39 @@ from src.utils import (
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
 
-@st.cache_data
-def _make_per_sample_tsv(_raw: pd.DataFrame) -> str:
+def _make_per_sample_tsv(raw: pd.DataFrame) -> str:
     # Drop raw allele-matrix position columns (all-digit names) — only keep
     # haplotype summary columns to avoid exploding memory on large queries.
-    pos_cols = [c for c in _raw.columns if str(c).isdigit()]
+    pos_cols = [c for c in raw.columns if str(c).isdigit()]
     return (
-        _raw.drop(columns=pos_cols)
+        raw.drop(columns=pos_cols)
         .explode("sample_ids")
         .rename(columns={"sample_ids": "sample_id"})
         .drop(columns=["n_samples"])
         .reset_index(drop=True)
         .to_csv(sep="\t", index=False)
     )
+
+
+def _format_ns_changes(val, mode: str) -> str:
+    """Format an ns_changes cell (list or str repr) for display."""
+    if isinstance(val, list):
+        changes = val
+    else:
+        try:
+            changes = ast.literal_eval(str(val))
+        except Exception:
+            return str(val)
+    if not isinstance(changes, list):
+        return str(val)
+    if not changes:
+        return ""
+    if mode == "compact":
+        return "/".join(changes)
+    if mode == "lower":
+        return ",".join(c.lower() for c in changes)
+    # default: Python list repr
+    return str(changes)
 
 st.set_page_config(layout="wide", page_title="Variant Marketplace", page_icon = "assets/logo.svg")
 
@@ -45,6 +66,7 @@ RAW_USER_INPUT = st.text_area(
     help=(
         "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · "
         "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
+        "Optional alias: `PF3D7_0709000[72,74](crt)` → columns named `crt_72`, `crt_74` · "
         "Multiple loci separated by spaces."
     ),
 )
@@ -172,63 +194,107 @@ het_mode_label = st.radio(
 )
 HET_MODE = _HET_LABELS[het_mode_label]
 
+if HET_MODE == "ordered_ad":
+    het_sep_label = st.radio(
+        "Separate het alleles with:",
+        ["/ (forward slash)", ", (comma)"],
+        horizontal=True,
+        help="How paired major/minor alleles are joined in output columns",
+    )
+    HET_SEP = "," if "(comma)" in het_sep_label else "/"
+else:
+    HET_SEP = "/"
+
 # Small state management section
-_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE)
+_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE, HET_SEP)
 if st.session_state.get("last_load_state") != _load_state:
-    st.session_state["last_load_state"]   = _load_state
-    st.session_state["haplotypes_built"] = False
+    st.session_state["last_load_state"]    = _load_state
+    st.session_state["haplotypes_built"]   = False
+    st.session_state.pop("haplotypes_raw", None)
 
 if not st.session_state.get("haplotypes_built"):
     if st.button("Build haplotypes", type="primary"):
         st.session_state["haplotypes_built"] = True
         st.rerun()
 else:
-    # Read the save-intermediates toggle value from the previous run so the
-    # computation can decide whether to stash allele_matrix before freeing it.
-    # (The toggle itself is defined later in the debug expander; session state
-    # bridges the forward reference across reruns.)
-    _save_intermediates = st.session_state.get("_debug_save_intermediates", False)
+    # ── Compute (once per unique input state) ─────────────────────────────────
+    if "haplotypes_raw" not in st.session_state:
+        _save_intermediates = st.session_state.get("_debug_save_intermediates", False)
 
-    t0 = time.time()
-    # Process one region at a time to cap peak memory — loading all genotype arrays
-    # simultaneously (n_loci × n_variants × n_samples) can exceed the Cloud limit.
-    partial_matrices = []
-    region_ids  = list(regions.keys())
-    n_regions   = len(region_ids)
-    progress    = st.progress(0, text="Loading genotypes…")
-    for i, source_id in enumerate(region_ids):
-        region = regions[source_id]
-        progress.progress(i / n_regions, text=f"Loading {source_id} ({i + 1}/{n_regions})…")
-        region["genotypes"], region["g1_wins"] = load_call_data(
-            region["ds"],
-            cache_key=(source_id, apply_filter_pass, apply_numalt1),
-            load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
+        t0 = time.time()
+        # Process one region at a time to cap peak memory.
+        partial_matrices = []
+        region_ids = list(regions.keys())
+        n_regions  = len(region_ids)
+        n_steps    = n_regions + 2  # +dedup +compute
+        progress   = st.progress(0, text="Loading genotypes…")
+
+        for i, source_id in enumerate(region_ids):
+            region = regions[source_id]
+            progress.progress(i / n_steps, text=f"Loading {source_id} ({i + 1}/{n_regions})…")
+            region["genotypes"], region["g1_wins"] = load_call_data(
+                region["ds"],
+                cache_key=(source_id, apply_filter_pass, apply_numalt1),
+                load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
+            )
+            partial_matrices.append(
+                build_allele_matrix({source_id: region}, excluded_positions, HET_MODE, HET_SEP)
+            )
+            region["genotypes"] = None
+            region["g1_wins"]   = None
+
+        progress.progress(n_regions / n_steps, text="Deduplicating allele matrix…")
+        allele_matrix = pd.concat(partial_matrices, axis=1)
+        partial_matrices.clear()
+
+        if _save_intermediates:
+            st.session_state["_debug_allele_matrix"] = allele_matrix.copy()
+
+        deduped = deduplicate_allele_matrix(allele_matrix)
+        allele_matrix = None
+
+        progress.progress((n_regions + 1) / n_steps, text="Computing haplotypes…")
+        raw = compute_haplotypes(
+            deduped, regions, resolved_loci, parsed_loci,
+            reference_files["cds_gff"], het_sep=HET_SEP,
         )
-        partial_matrices.append(
-            build_allele_matrix({source_id: region}, excluded_positions, HET_MODE)
+        progress.progress(1.0, text="Done!")
+        progress.empty()
+
+        st.session_state["haplotypes_raw"]    = raw
+        st.session_state["_debug_deduped"]    = deduped
+        st.session_state["_hap_elapsed"]      = time.time() - t0
+
+    raw     = st.session_state["haplotypes_raw"]
+    deduped = st.session_state.get("_debug_deduped")
+    st.success(f"Loaded in {st.session_state['_hap_elapsed']:.1f}s")
+
+    # ── ns_changes display toggles ─────────────────────────────────────────────
+    ns_cols = [c for c in raw.columns if c.endswith("_ns_changes")]
+    if ns_cols:
+        _nsc1, _nsc2, _ = st.columns(3)
+        ns_compact = _nsc1.toggle(
+            "Compact ns_changes",
+            value=False,
+            help="Show as N462A/G928W instead of a Python list",
         )
-        region["genotypes"] = None
-        region["g1_wins"]   = None
-    progress.empty()
+        ns_lower = _nsc2.toggle(
+            "Lowercase ns_changes",
+            value=False,
+            help="Show each change in lowercase comma-separated: n462a,g928w",
+        )
+        _ns_mode = "lower" if ns_lower else ("compact" if ns_compact else "list")
+    else:
+        _ns_mode = "list"
 
-    allele_matrix = pd.concat(partial_matrices, axis=1)
-    partial_matrices.clear()
-
-    if _save_intermediates:
-        st.session_state["_debug_allele_matrix"] = allele_matrix.copy()
-
-    deduped = deduplicate_allele_matrix(allele_matrix)
-    allele_matrix = None  # free before haplotype computation
-
-    raw = compute_haplotypes(
-        deduped, regions, resolved_loci, parsed_loci, reference_files["cds_gff"]
-    )
-
-    st.success(f"Loaded in {time.time() - t0:.1f}s")
+    # Build display copy with formatted ns_changes
+    display_raw = raw.copy()
+    for _c in ns_cols:
+        display_raw[_c] = display_raw[_c].apply(lambda v: _format_ns_changes(v, _ns_mode))
 
     st.download_button(
         "Download per-sample TSV",
-        _make_per_sample_tsv(raw),
+        _make_per_sample_tsv(display_raw),
         file_name="haplotypes.tsv",
         mime="text/tab-separated-values",
     )
@@ -241,15 +307,16 @@ else:
                 help="When on, the allele matrix is preserved in session state before being freed. "
                      "Flip on, then re-run by changing any input.",
             )
-            if _save_intermediates and "_debug_allele_matrix" in st.session_state:
+            if st.session_state.get("_debug_save_intermediates") and "_debug_allele_matrix" in st.session_state:
                 st.write("**Allele matrix** (samples × positions)")
                 st.dataframe(st.session_state["_debug_allele_matrix"], hide_index=False, width="stretch")
 
-            st.write("**Deduplicated allele matrix**")
-            st.dataframe(deduped, hide_index=True, width="stretch")
+            if deduped is not None:
+                st.write("**Deduplicated allele matrix**")
+                st.dataframe(deduped, hide_index=True, width="stretch")
 
             st.write("**Haplotype output**")
-            st.dataframe(raw, hide_index=True, width="stretch")
+            st.dataframe(display_raw, hide_index=True, width="stretch")
 
 
 # if not genotypes_loaded:
