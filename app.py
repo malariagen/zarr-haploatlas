@@ -1,4 +1,5 @@
 import ast
+import re
 import time
 import pandas as pd
 import numpy as np
@@ -26,7 +27,31 @@ def _make_per_sample_tsv(raw: pd.DataFrame) -> str:
     )
 
 
-def _format_ns_changes(val, mode: str) -> str:
+_NS_ENTRY_RE = re.compile(r'^([A-Za-z?])(\d+)([A-Za-z*\-])$')
+
+
+def _expand_ns_entry(entry: str, het_sep: str) -> list[str]:
+    """Split a het entry like 'R371R/I' into ['R371R', 'R371I']; pass-through otherwise."""
+    if het_sep not in entry:
+        return [entry]
+    major_part, minor_aa = entry.split(het_sep, 1)
+    m = _NS_ENTRY_RE.match(major_part)
+    if m:
+        ref_aa, pos = m.group(1), m.group(2)
+        return [major_part, f"{ref_aa}{pos}{minor_aa}"]
+    return [entry]
+
+
+def _format_ns_entry_lower(entry: str) -> str:
+    """Lowercase a single entry; drop the redundant alt when ref == alt (e.g. R371R → r371)."""
+    low = entry.lower()
+    m = _NS_ENTRY_RE.match(entry)
+    if m and m.group(1).upper() == m.group(3).upper():
+        return f"{m.group(1).lower()}{m.group(2)}"
+    return low
+
+
+def _format_ns_changes(val, mode: str, het_sep: str = "/") -> str:
     """Format an ns_changes cell (list or str repr) for display."""
     if isinstance(val, list):
         changes = val
@@ -42,11 +67,18 @@ def _format_ns_changes(val, mode: str) -> str:
     if mode == "compact":
         return "/".join(changes)
     if mode == "lower":
-        return ",".join(c.lower() for c in changes)
+        parts = []
+        for c in changes:
+            for entry in _expand_ns_entry(c, het_sep):
+                parts.append(_format_ns_entry_lower(entry))
+        return ",".join(parts)
     # default: Python list repr
     return str(changes)
 
 st.set_page_config(layout="wide", page_title="Variant Marketplace", page_icon = "assets/logo.svg")
+
+st.logo("assets/logo.svg", size = "large")
+st.title("Variant Marketplace", text_alignment="center")
 
 # ── Load static data ──────────────────────────────────────────────────────────
 chunk_index_df  = build_chunk_index()
@@ -54,9 +86,6 @@ reference_files = load_reference_files()
 variant_data    = load_variant_data()
 
 # ── User input ────────────────────────────────────────────────────────────────
-
-st.logo("assets/logo.svg", size = "large")
-st.title("Variant Marketplace", text_alignment="center")
 
 DEBUG = st.toggle("Debug mode", value=False)
 
@@ -269,28 +298,28 @@ else:
     deduped = st.session_state.get("_debug_deduped")
     st.success(f"Loaded in {st.session_state['_hap_elapsed']:.1f}s")
 
-    # ── ns_changes display toggles ─────────────────────────────────────────────
+    # ── ns_changes display format ──────────────────────────────────────────────
     ns_cols = [c for c in raw.columns if c.endswith("_ns_changes")]
     if ns_cols:
-        _nsc1, _nsc2, _ = st.columns(3)
-        ns_compact = _nsc1.toggle(
-            "Compact ns_changes",
-            value=False,
-            help="Show as N462A/G928W instead of a Python list",
-        )
-        ns_lower = _nsc2.toggle(
-            "Lowercase ns_changes",
-            value=False,
-            help="Show each change in lowercase comma-separated: n462a,g928w",
-        )
-        _ns_mode = "lower" if ns_lower else ("compact" if ns_compact else "list")
+        _NS_FORMAT_OPTS = {
+            "List  ['N462A', 'G928W']":  "list",
+            "Compact  N462A/G928W":       "compact",
+            "Lowercase  n462a,g928w":     "lower",
+        }
+        _ns_mode = _NS_FORMAT_OPTS[st.radio(
+            "ns_changes format",
+            list(_NS_FORMAT_OPTS.keys()),
+            horizontal=True,
+        )]
     else:
         _ns_mode = "list"
 
     # Build display copy with formatted ns_changes
     display_raw = raw.copy()
     for _c in ns_cols:
-        display_raw[_c] = display_raw[_c].apply(lambda v: _format_ns_changes(v, _ns_mode))
+        display_raw[_c] = display_raw[_c].apply(
+            lambda v: _format_ns_changes(v, _ns_mode, HET_SEP)
+        )
 
     st.download_button(
         "Download per-sample TSV",
