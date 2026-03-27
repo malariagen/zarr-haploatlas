@@ -211,6 +211,19 @@ else:
 
     st.success(f"Loaded in {time.time() - t0:.1f}s")
 
+    per_sample = (
+        raw.explode("sample_ids")
+        .rename(columns={"sample_ids": "sample_id"})
+        .drop(columns=["n_samples"])
+        .reset_index(drop=True)
+    )
+    st.download_button(
+        "Download per-sample TSV",
+        per_sample.to_csv(sep="\t", index=False),
+        file_name="haplotypes.tsv",
+        mime="text/tab-separated-values",
+    )
+
     if DEBUG:
         with st.expander("Debug"):
             st.toggle(
