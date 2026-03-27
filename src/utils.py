@@ -88,24 +88,27 @@ def build_chunk_index() -> pd.DataFrame:
 # ── Locus parsing & resolution ────────────────────────────────────────────────
 
 def parse_loci_from_input(user_input: str) -> pd.DataFrame:
+    # Match IDENTIFIER[...] tokens; [...] may contain spaces after commas.
+    # Using a non-whitespace identifier followed by a bracket group lets us
+    # tolerate any number of spaces between loci without splitting inside brackets.
+    tokens = re.findall(r'([^\s\[]+\[[^\]]+\])', user_input)
     rows = []
-    for part in user_input.split():
-        if "[" not in part or "]" not in part:
-            continue
-
-        identifier, pos_part = part.split("[", 1)
+    for token in tokens:
+        identifier, pos_part = token.split("[", 1)
         pos_part = pos_part.rstrip("]")
 
         is_gene    = bool(re.match(r"^PF3D7_\d{7}$", identifier, re.IGNORECASE))
         coord_type = "aa" if is_gene else "nt"
 
-        for token in pos_part.split(","):
-            token = token.strip()
-            if "-" in token:
-                start, end = token.split("-", 1)
-                rows.append((identifier, int(start), int(end), coord_type))
+        for part in pos_part.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start, end = part.split("-", 1)
+                rows.append((identifier, int(start.strip()), int(end.strip()), coord_type))
             else:
-                pos = int(token)
+                pos = int(part)
                 rows.append((identifier, pos, pos, coord_type))
 
     return pd.DataFrame(rows, columns=["chrom", "start", "end", "coord_type"])
@@ -362,7 +365,7 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
             "needs_translation": coord_type == "aa",
             "ref":               ref_allele,
             "ref_len":           len(ref_allele),
-            "alt":               ", ".join(alts),
+            "alt":               alts,
             "is_snp":            meta["is_snp"][vi],
             "filter_pass":       meta["filter_pass"][vi],
             "CDS":               meta["CDS"][vi],

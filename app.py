@@ -24,7 +24,7 @@ st.title("Variant Marketplace", text_alignment="center")
 
 DEBUG = st.toggle("Debug mode", value=False)
 
-RAW_USER_INPUT = st.text_input(
+RAW_USER_INPUT = st.text_area(
     "Enter genomic loci",
     value="PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
     help=(
@@ -120,7 +120,15 @@ styled_meta = (
     .apply(_highlight_failed, axis=1)
     .map(_color_bool, subset=_BOOL_COLS)
 )
-st.dataframe(styled_meta, hide_index=True, width="stretch")
+st.dataframe(
+    styled_meta,
+    hide_index=True,
+    width="stretch",
+    column_config={
+        "alt":    st.column_config.ListColumn("alt alleles"),
+        "numalt": None,
+    },
+)
 st.caption(
     f"{total_vars} variant sites across {len(regions)} {'locus' if len(regions) == 1 else 'loci'}, "
     f"affecting {n_samples:,} samples."
@@ -132,7 +140,7 @@ st.caption(
 # 2. Haplotypes
 # ══════════════════════════════════════════════════════════════════════════════
 st.divider()
-st.subheader("Haplotypes")
+st.subheader("Build haplotypes")
 
 _HET_LABELS = {
     "Exclude and only use hom calls": "exclude",
@@ -157,24 +165,39 @@ if not st.session_state.get("haplotypes_built"):
         st.session_state["haplotypes_built"] = True
         st.rerun()
 else:
+    # Read the save-intermediates toggle value from the previous run so the
+    # computation can decide whether to stash allele_matrix before freeing it.
+    # (The toggle itself is defined later in the debug expander; session state
+    # bridges the forward reference across reruns.)
+    _save_intermediates = st.session_state.get("_debug_save_intermediates", False)
+
     t0 = time.time()
-    with st.spinner(f"Loading genotypes for {n_samples:,} samples…"):
-        for source_id, region in regions.items():
-            region["genotypes"], region["g1_wins"] = load_call_data(
-                region["ds"],
-                cache_key=(source_id, apply_filter_pass, apply_numalt1),
-                load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
-            )
-    
-    allele_matrix = build_allele_matrix(
-        regions,
-        excluded_positions=excluded_positions,
-        het_mode=HET_MODE,
-    )
-    # Free genotype arrays — no longer needed once the allele matrix is built
-    for region in regions.values():
+    # Process one region at a time to cap peak memory — loading all genotype arrays
+    # simultaneously (n_loci × n_variants × n_samples) can exceed the Cloud limit.
+    partial_matrices = []
+    region_ids  = list(regions.keys())
+    n_regions   = len(region_ids)
+    progress    = st.progress(0, text="Loading genotypes…")
+    for i, source_id in enumerate(region_ids):
+        region = regions[source_id]
+        progress.progress(i / n_regions, text=f"Loading {source_id} ({i + 1}/{n_regions})…")
+        region["genotypes"], region["g1_wins"] = load_call_data(
+            region["ds"],
+            cache_key=(source_id, apply_filter_pass, apply_numalt1),
+            load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
+        )
+        partial_matrices.append(
+            build_allele_matrix({source_id: region}, excluded_positions, HET_MODE)
+        )
         region["genotypes"] = None
         region["g1_wins"]   = None
+    progress.empty()
+
+    allele_matrix = pd.concat(partial_matrices, axis=1)
+    partial_matrices.clear()
+
+    if _save_intermediates:
+        st.session_state["_debug_allele_matrix"] = allele_matrix.copy()
 
     deduped = deduplicate_allele_matrix(allele_matrix)
     allele_matrix = None  # free before haplotype computation
@@ -186,15 +209,22 @@ else:
     st.success(f"Loaded in {time.time() - t0:.1f}s")
 
     if DEBUG:
-        with st.expander("Debug — haplotype computation"):
-            # st.write("**Allele matrix** (samples × positions)")
-            # st.dataframe(allele_matrix, hide_index=False, width = "stretch")
+        with st.expander("Debug"):
+            st.toggle(
+                "Save intermediate outputs",
+                key="_debug_save_intermediates",
+                help="When on, the allele matrix is preserved in session state before being freed. "
+                     "Flip on, then re-run by changing any input.",
+            )
+            if _save_intermediates and "_debug_allele_matrix" in st.session_state:
+                st.write("**Allele matrix** (samples × positions)")
+                st.dataframe(st.session_state["_debug_allele_matrix"], hide_index=False, width="stretch")
 
             st.write("**Deduplicated allele matrix**")
-            st.dataframe(deduped, hide_index=True, width = "stretch")
+            st.dataframe(deduped, hide_index=True, width="stretch")
 
             st.write("**Haplotype output**")
-            st.dataframe(raw, hide_index=True, width = "stretch")
+            st.dataframe(raw, hide_index=True, width="stretch")
 
 
 # if not genotypes_loaded:
