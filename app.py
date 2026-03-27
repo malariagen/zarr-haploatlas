@@ -10,7 +10,7 @@ from src.utils import (
 )
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
-st.set_page_config(layout="wide", page_title="FIX ME")
+st.set_page_config(layout="wide", page_title="Variant Marketplace", page_icon = "assets/logo.svg")
 
 # ── Load static data ──────────────────────────────────────────────────────────
 chunk_index_df  = build_chunk_index()
@@ -18,7 +18,9 @@ reference_files = load_reference_files()
 variant_data    = load_variant_data()
 
 # ── User input ────────────────────────────────────────────────────────────────
-st.title("Data Marketplace", text_alignment="center")
+
+st.logo("assets/logo.svg", size = "large")
+st.title("Variant Marketplace", text_alignment="center")
 
 DEBUG = st.toggle("Debug mode", value=False)
 
@@ -185,8 +187,8 @@ else:
 
     if DEBUG:
         with st.expander("Debug — haplotype computation"):
-            st.write("**Allele matrix** (samples × positions)")
-            st.dataframe(allele_matrix, hide_index=False, width = "stretch")
+            # st.write("**Allele matrix** (samples × positions)")
+            # st.dataframe(allele_matrix, hide_index=False, width = "stretch")
 
             st.write("**Deduplicated allele matrix**")
             st.dataframe(deduped, hide_index=True, width = "stretch")
