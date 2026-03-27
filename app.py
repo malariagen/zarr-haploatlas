@@ -10,6 +10,21 @@ from src.utils import (
 )
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
 
+
+@st.cache_data
+def _make_per_sample_tsv(_raw: pd.DataFrame) -> str:
+    # Drop raw allele-matrix position columns (all-digit names) — only keep
+    # haplotype summary columns to avoid exploding memory on large queries.
+    pos_cols = [c for c in _raw.columns if str(c).isdigit()]
+    return (
+        _raw.drop(columns=pos_cols)
+        .explode("sample_ids")
+        .rename(columns={"sample_ids": "sample_id"})
+        .drop(columns=["n_samples"])
+        .reset_index(drop=True)
+        .to_csv(sep="\t", index=False)
+    )
+
 st.set_page_config(layout="wide", page_title="Variant Marketplace", page_icon = "assets/logo.svg")
 
 # ── Load static data ──────────────────────────────────────────────────────────
@@ -211,15 +226,9 @@ else:
 
     st.success(f"Loaded in {time.time() - t0:.1f}s")
 
-    per_sample = (
-        raw.explode("sample_ids")
-        .rename(columns={"sample_ids": "sample_id"})
-        .drop(columns=["n_samples"])
-        .reset_index(drop=True)
-    )
     st.download_button(
         "Download per-sample TSV",
-        per_sample.to_csv(sep="\t", index=False),
+        _make_per_sample_tsv(raw),
         file_name="haplotypes.tsv",
         mime="text/tab-separated-values",
     )
