@@ -44,6 +44,9 @@ if parsed_loci.empty:
 
 if DEBUG:
     with st.expander("Debug"):
+        st.write("**Chunk index** (all chromosomes in zarr)")
+        st.dataframe(chunk_index_df, width="stretch", hide_index=True)
+
         st.write("**Parsed loci:**")
         st.dataframe(parsed_loci, width="stretch", hide_index=True)
 
