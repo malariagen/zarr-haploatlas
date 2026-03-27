@@ -369,24 +369,31 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
     return rows
 
 
-def load_call_data(ds: xr.Dataset) -> tuple[np.ndarray, np.ndarray | None]:
+@st.cache_data
+def load_call_data(_ds: xr.Dataset, cache_key: tuple, load_ad: bool = True) -> tuple[np.ndarray, np.ndarray | None]:
     """
-    Load genotypes and, if available, a precomputed allele-depth comparison.
+    Load genotypes and, if requested, a precomputed allele-depth comparison.
+
+    Args:
+        _ds:       xr.Dataset for the region. Prefixed with _ so Streamlit excludes it
+                   from the cache key (xr.Dataset is not hashable).
+        cache_key: stable hashable key that uniquely identifies this dataset —
+                   pass (source_id, apply_filter_pass, apply_numalt1) from the caller.
+                   Must change whenever _ds changes.
+        load_ad:   set to False to skip AD entirely (e.g. when het_mode="exclude").
+                   Halves the data downloaded from GCS.
 
     Returns:
         genotypes: (n_variants, n_samples, 2) int8
         g1_wins:   (n_variants, n_samples) bool — True where the first called allele
-                   has >= depth than the second. None if AD is unavailable.
-
-    Reducing AD to a single boolean per call avoids storing the full
-    (n_variants × n_samples × n_alleles) int32 array in memory.
+                   has >= depth than the second. None if load_ad=False.
     """
-    genotypes = ds["call_genotype"].values.astype(np.int8)
+    genotypes = _ds["call_genotype"].values.astype(np.int8)
 
-    try:
-        ad = ds["call_AD"].values  # (n_variants, n_samples, n_alleles)
-    except (KeyError, AttributeError):
+    if not load_ad:
         return genotypes, None
+
+    ad = _ds["call_AD"].values  # (n_variants, n_samples, n_alleles)
 
     n_v, n_s   = genotypes.shape[:2]
     n_alleles  = ad.shape[2]
@@ -449,6 +456,12 @@ def build_allele_matrix(
 
             if het_mode == "major_ad" and g1_wins is not None:
                 calls = np.where(missing, "-", np.where(het, np.where(g1_wins[vi], a1, a2), a1))
+            elif het_mode == "ordered_ad" and g1_wins is not None:
+                # "major/minor" ordered by allele depth
+                major   = np.where(g1_wins[vi], a1, a2)
+                minor   = np.where(g1_wins[vi], a2, a1)
+                ordered = np.array([f"{m}/{n}" for m, n in zip(major, minor)], dtype=object)
+                calls   = np.where(missing, "-", np.where(het, ordered, a1))
             else:
                 calls = np.where(missing, "-", np.where(het, "*", a1))
 

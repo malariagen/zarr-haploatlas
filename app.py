@@ -118,7 +118,7 @@ styled_meta = (
     .apply(_highlight_failed, axis=1)
     .map(_color_bool, subset=_BOOL_COLS)
 )
-st.dataframe(styled_meta, hide_index=True)
+st.dataframe(styled_meta, hide_index=True, width="stretch")
 st.caption(
     f"{total_vars} variant sites across {len(regions)} {'locus' if len(regions) == 1 else 'loci'}, "
     f"affecting {n_samples:,} samples."
@@ -134,7 +134,8 @@ st.subheader("Haplotypes")
 
 _HET_LABELS = {
     "Exclude and only use hom calls": "exclude",
-    "Use the major allele":           "major_ad"
+    "Use the major allele":           "major_ad",
+    "Order alleles by depth":         "ordered_ad",
 }
 het_mode_label = st.radio(
     "How to handle heterozygous genotypes when computing haplotypes:",
@@ -144,25 +145,48 @@ het_mode_label = st.radio(
 HET_MODE = _HET_LABELS[het_mode_label]
 
 # Small state management section
-_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1)
+_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE)
 if st.session_state.get("last_load_state") != _load_state:
     st.session_state["last_load_state"]   = _load_state
-    st.session_state["haplotypes_loaded"] = False
+    st.session_state["haplotypes_built"] = False
 
-if not st.session_state.get("haplotypes_loaded"):
-    if st.button("Load haplotypes", type="primary"):
-        st.session_state["haplotypes_loaded"] = True
+if not st.session_state.get("haplotypes_built"):
+    if st.button("Build haplotypes", type="primary"):
+        st.session_state["haplotypes_built"] = True
         st.rerun()
 else:
     t0 = time.time()
     with st.spinner(f"Loading genotypes for {n_samples:,} samples…"):
-        for region in regions.values():
-            region["genotypes"], region["g1_wins"] = load_call_data(region["ds"])
-    st.success(f"Loaded in {time.time() - t0:.1f}s")
+        for source_id, region in regions.items():
+            region["genotypes"], region["g1_wins"] = load_call_data(
+                region["ds"],
+                cache_key=(source_id, apply_filter_pass, apply_numalt1),
+                load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
+            )
     
+    allele_matrix = build_allele_matrix(
+        regions,
+        excluded_positions=excluded_positions,
+        het_mode=HET_MODE,
+    )
 
+    deduped = deduplicate_allele_matrix(allele_matrix)
+    raw = compute_haplotypes(
+        deduped, regions, resolved_loci, parsed_loci, reference_files["cds_gff"]
+    )
 
+    st.success(f"Loaded in {time.time() - t0:.1f}s")
 
+    if DEBUG:
+        with st.expander("Debug — haplotype computation"):
+            st.write("**Allele matrix** (samples × positions)")
+            st.dataframe(allele_matrix, hide_index=False, width = "stretch")
+
+            st.write("**Deduplicated allele matrix**")
+            st.dataframe(deduped, hide_index=True, width = "stretch")
+
+            st.write("**Haplotype output**")
+            st.dataframe(raw, hide_index=True, width = "stretch")
 
 
 # if not genotypes_loaded:

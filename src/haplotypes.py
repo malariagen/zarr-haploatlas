@@ -94,8 +94,9 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
         observed = alleles_here.get(pos_str, info["ref"])
         ref_a    = info["ref"]
 
-        # Multi-allele cells from "all_ad" mode → treat as reference
-        if isinstance(observed, str) and "," in observed:
+        # Multi-allele cells ("G,T") and ordered-ad pairs ("G/T") → treat as reference;
+        # the callers that need both translations handle them before calling this function.
+        if isinstance(observed, str) and ("," in observed or "/" in observed):
             continue
 
         # Strip trailing '-'/null padding; leave special markers untouched
@@ -227,6 +228,20 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
     for _, row in deduped.iterrows():
         alleles_here = {p: row[p] for p in pos_info if p in deduped.columns}
 
+        # ordered_ad positions hold "major/minor" nucleotide pairs — pre-compute
+        # separate major/minor translations so per-position columns can show "S/A".
+        ordered_pos = {p for p, v in alleles_here.items() if isinstance(v, str) and "/" in v}
+        if ordered_pos:
+            alleles_major = {p: v.split("/")[0] if p in ordered_pos else v
+                             for p, v in alleles_here.items()}
+            alleles_minor = {p: v.split("/")[1] if p in ordered_pos else v
+                             for p, v in alleles_here.items()}
+            alt_aa_major = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_major), strand)
+            alt_aa_minor = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_minor), strand)
+        else:
+            alt_aa_major = alt_aa_minor = None
+
+        # "/" alleles are treated as reference by _apply_variants (same as "," alleles)
         alt_cds = _apply_variants(ref_cds, sorted_pos_info, alleles_here)
         alt_aa  = _translate(alt_cds, strand)
 
@@ -238,15 +253,16 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
                              for p in aa_to_pos.get(aa_p, [])]
             range_alleles = [alleles_here.get(p) for p in range_pos]
 
-            has_missing = "-" in range_alleles
-            has_het     = HET_SYMBOL in range_alleles
-            has_multi   = any(isinstance(v, str) and "," in v for v in range_alleles)
+            has_missing  = "-" in range_alleles
+            has_het      = HET_SYMBOL in range_alleles
+            has_multi    = any(isinstance(v, str) and "," in v for v in range_alleles)
+            has_ordered  = any(p in ordered_pos for p in range_pos)
 
             if has_missing:
                 hap_parts.append("-")
-            elif has_het:
-                hap_parts.append(HET_SYMBOL)
-            elif has_multi:
+            elif has_het or has_ordered or has_multi:
+                # ordered/het ranges collapse to "*" in the haplotype summary;
+                # per-position columns still show the "S/A" breakdown.
                 hap_parts.append(HET_SYMBOL)
             else:
                 hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end)
@@ -254,9 +270,10 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
 
             # ns_changes for each individual AA position in this range
             for aa_pos in range(aa_start, aa_end + 1):
-                codon_vars = aa_to_pos.get(aa_pos, [])
-                is_missing = any(alleles_here.get(p) == "-" for p in codon_vars)
-                is_het     = any(alleles_here.get(p) == HET_SYMBOL for p in codon_vars)
+                codon_vars  = aa_to_pos.get(aa_pos, [])
+                is_missing  = any(alleles_here.get(p) == "-" for p in codon_vars)
+                is_het      = any(alleles_here.get(p) == HET_SYMBOL for p in codon_vars)
+                is_ordered  = any(p in ordered_pos for p in codon_vars)
                 ref_a = ref_aa[aa_pos - 1] if len(ref_aa) >= aa_pos else "?"
                 alt_a = _aa_at(alt_aa, aa_pos)
 
@@ -264,23 +281,36 @@ def _add_aa_haplotypes(result, deduped, source_id, meta, aa_ranges,
                     ns_list.append(f"{ref_a}{aa_pos}-")
                 elif is_het:
                     ns_list.append(f"{ref_a}{aa_pos}{HET_SYMBOL}")
+                elif is_ordered:
+                    aa_m = _aa_at(alt_aa_major, aa_pos)
+                    aa_n = _aa_at(alt_aa_minor, aa_pos)
+                    if aa_m == aa_n:
+                        if aa_m != ref_a:
+                            ns_list.append(f"{ref_a}{aa_pos}{aa_m}")
+                    else:
+                        ns_list.append(f"{ref_a}{aa_pos}{aa_m}/{aa_n}")
                 elif ref_a != alt_a:
                     ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
 
         # Per-individual-position columns
         for aa_pos in all_aa_positions:
-            col_name   = f"{source_id}_{aa_pos}"
-            codon_vars = aa_to_pos.get(aa_pos, [])
+            col_name    = f"{source_id}_{aa_pos}"
+            codon_vars  = aa_to_pos.get(aa_pos, [])
             pos_alleles = [alleles_here.get(p) for p in codon_vars]
 
             has_missing = "-" in pos_alleles
             has_het     = HET_SYMBOL in pos_alleles
             has_multi   = any(isinstance(v, str) and "," in v for v in pos_alleles)
+            is_ordered  = any(p in ordered_pos for p in codon_vars)
 
             if has_missing:
                 per_pos_lists[col_name].append("-")
             elif has_het:
                 per_pos_lists[col_name].append(HET_SYMBOL)
+            elif is_ordered:
+                aa_m = _aa_at(alt_aa_major, aa_pos)
+                aa_n = _aa_at(alt_aa_minor, aa_pos)
+                per_pos_lists[col_name].append(f"{aa_m}/{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
                               if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
@@ -359,11 +389,28 @@ def _add_nt_haplotypes(result, deduped, source_id, meta, nt_ranges,
                 per_iv_lists[cn].append("-")
             continue
 
+        # ordered_ad positions hold "major/minor" nucleotide pairs
+        ordered_pos = {p for p, v in alleles_here.items() if isinstance(v, str) and "/" in v}
+        if ordered_pos:
+            alleles_major = {p: v.split("/")[0] if p in ordered_pos else v
+                             for p, v in alleles_here.items()}
+            alleles_minor = {p: v.split("/")[1] if p in ordered_pos else v
+                             for p, v in alleles_here.items()}
+
         parts = []
         for (chrom, iv_start, iv_end), sorted_pos_info, col_name in zip(
                 intervals, interval_pos_infos, interval_col_names):
-            ref_iv  = ref_genome[chrom][iv_start - 1 : iv_end]
-            alt_seq = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
+            ref_iv     = ref_genome[chrom][iv_start - 1 : iv_end]
+            iv_pos_set = {p for p, _ in sorted_pos_info}
+            iv_ordered = ordered_pos & iv_pos_set
+
+            if iv_ordered:
+                alt_major = _apply_variants(ref_iv, sorted_pos_info, alleles_major)
+                alt_minor = _apply_variants(ref_iv, sorted_pos_info, alleles_minor)
+                alt_seq   = f"{alt_major}/{alt_minor}" if alt_major != alt_minor else alt_major
+            else:
+                alt_seq = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
+
             parts.append(alt_seq)
             per_iv_lists[col_name].append(alt_seq)
 
