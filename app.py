@@ -169,8 +169,14 @@ else:
         excluded_positions=excluded_positions,
         het_mode=HET_MODE,
     )
+    # Free genotype arrays — no longer needed once the allele matrix is built
+    for region in regions.values():
+        region["genotypes"] = None
+        region["g1_wins"]   = None
 
     deduped = deduplicate_allele_matrix(allele_matrix)
+    allele_matrix = None  # free before haplotype computation
+
     raw = compute_haplotypes(
         deduped, regions, resolved_loci, parsed_loci, reference_files["cds_gff"]
     )

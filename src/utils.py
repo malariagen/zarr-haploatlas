@@ -34,8 +34,10 @@ def load_reference_files() -> dict:
     }
 
 
-@st.cache_data
+@st.cache_resource(show_spinner="Connecting to variant data…")
 def load_variant_data():
+    # cache_resource keeps a single reference; cache_data would pickle the entire
+    # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
     return malariagen_data.Pf8().variant_calls()
 
 
