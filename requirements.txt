@@ -1,5 +1,6 @@
 malariagen_data==15.6.0
 streamlit==1.54.0
+biopython
 dask
 numpy
 pandas
