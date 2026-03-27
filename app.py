@@ -41,12 +41,7 @@ def _expand_ns_entry(entry: str, het_sep: str) -> list[str]:
 
 
 def _format_ns_entry_lower(entry: str) -> str:
-    """Lowercase a single entry; drop the redundant alt when ref == alt (e.g. R371R → r371)."""
-    low = entry.lower()
-    m = _NS_ENTRY_RE.match(entry)
-    if m and m.group(1).upper() == m.group(3).upper():
-        return f"{m.group(1).lower()}{m.group(2)}"
-    return low
+    return entry.lower()
 
 
 def _format_ns_changes(val, mode: str, het_sep: str = "/") -> str:
@@ -232,6 +227,17 @@ if HET_MODE == "ordered_ad":
 else:
     HET_SEP = "/"
 
+_NS_FORMAT_OPTS = {
+    "List  ['N462A', 'G928W']": "list",
+    "Compact  N462A/G928W":     "compact",
+    "Lowercase  n86n,n86y":     "lower",
+}
+_ns_mode = _NS_FORMAT_OPTS[st.radio(
+    "ns_changes format",
+    list(_NS_FORMAT_OPTS.keys()),
+    horizontal=True,
+)]
+
 # Small state management section
 _load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE, HET_SEP)
 if st.session_state.get("last_load_state") != _load_state:
@@ -240,8 +246,9 @@ if st.session_state.get("last_load_state") != _load_state:
     st.session_state.pop("haplotypes_raw", None)
 
 if not st.session_state.get("haplotypes_built"):
-    if st.button("Build haplotypes", type="primary"):
+    if st.button("Build & download haplotypes", type="primary"):
         st.session_state["haplotypes_built"] = True
+        st.session_state["_auto_download"]   = True
         st.rerun()
 else:
     # ── Compute (once per unique input state) ─────────────────────────────────
@@ -304,32 +311,33 @@ else:
     deduped = st.session_state.get("_debug_deduped")
     st.success(f"Loaded in {st.session_state['_hap_elapsed']:.1f}s")
 
-    # ── ns_changes display format ──────────────────────────────────────────────
-    ns_cols = [c for c in raw.columns if c.endswith("_ns_changes")]
-    if ns_cols:
-        _NS_FORMAT_OPTS = {
-            "List  ['N462A', 'G928W']":  "list",
-            "Compact  N462A/G928W":       "compact",
-            "Lowercase  n462a,g928w":     "lower",
-        }
-        _ns_mode = _NS_FORMAT_OPTS[st.radio(
-            "ns_changes format",
-            list(_NS_FORMAT_OPTS.keys()),
-            horizontal=True,
-        )]
-    else:
-        _ns_mode = "list"
-
-    # Build display copy with formatted ns_changes
+    # ── Build display copy with ns_changes formatted per the earlier selection ──
+    ns_cols     = [c for c in raw.columns if c.endswith("_ns_changes")]
     display_raw = raw.copy()
     for _c in ns_cols:
         display_raw[_c] = display_raw[_c].apply(
             lambda v: _format_ns_changes(v, _ns_mode, HET_SEP)
         )
 
+    # ── Auto-download on first render after computation, then show button ──────
+    _tsv = _make_per_sample_tsv(display_raw)
+    if st.session_state.pop("_auto_download", False):
+        import base64
+        _b64 = base64.b64encode(_tsv.encode()).decode()
+        st.components.v1.html(
+            f"""<script>
+            (function(){{
+                var a=document.createElement('a');
+                a.href='data:text/tab-separated-values;base64,{_b64}';
+                a.download='haplotypes.tsv';
+                document.body.appendChild(a);a.click();document.body.removeChild(a);
+            }})();
+            </script>""",
+            height=0,
+        )
     st.download_button(
-        "Download per-sample TSV",
-        _make_per_sample_tsv(display_raw),
+        "Re-download TSV",
+        _tsv,
         file_name="haplotypes.tsv",
         mime="text/tab-separated-values",
     )
