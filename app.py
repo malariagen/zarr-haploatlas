@@ -200,14 +200,14 @@ st.subheader("Build haplotypes")
 
 _FORMAT_OPTS = {
     "default  ·  -T,[T/M]GK  ·  G42-, K43T, M56[T/M], C58K":          "default",
-    "skip  ·  -T,*GK  ·  G42-, K43T, M56*, C58K  (faster, no AD)":    "skip",
+    "skip  ·  -T,\*GK  ·  G42-, K43T, M56*, C58K  (faster, no AD)":    "skip",
     "collapse  ·  -T,TGK  ·  G42-, K43T, M56T, C58K":                  "collapse",
     "wide  ·  -T,[T/M]GK  ·  G42-, K43T, M56T, M56M, C58K":           "wide",
 }
 FORMAT_MODE = _FORMAT_OPTS[st.radio(
     "Haplotype format",
     list(_FORMAT_OPTS.keys()),
-    horizontal=False,
+    horizontal=True,
     help=(
         "**default** – het positions shown as [major/minor] ordered by allele depth · "
         "**skip** – hets shown as * (no AD loaded, faster) · "
