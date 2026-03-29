@@ -119,16 +119,16 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
 
 
 def _aa_at(alt_aa: str, pos: int) -> str:
-    """Return amino acid at 1-based position, 'X' if beyond sequence (premature stop)."""
+    """Return amino acid at 1-based position, '!' if beyond sequence (premature stop)."""
     if pos < 1 or pos > len(alt_aa):
-        return "X"
+        return "!"
     return alt_aa[pos - 1]
 
 
 def _aa_slice(alt_aa: str, start: int, end: int) -> str:
-    """Return AA substring for 1-based inclusive [start, end], 'X' if truncated."""
+    """Return AA substring for 1-based inclusive [start, end], '!' if truncated."""
     if start < 1 or end > len(alt_aa):
-        return "X"
+        return "!"
     return alt_aa[start - 1 : end]
 
 
@@ -137,7 +137,8 @@ def _aa_slice(alt_aa: str, start: int, end: int) -> str:
 def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
                        loci_df: pd.DataFrame, cds_gff: pd.DataFrame,
                        ref_fasta_path: str = REF_FASTA,
-                       het_sep: str = "/") -> pd.DataFrame:
+                       het_sep: str = "/",
+                       mode: str = "default") -> pd.DataFrame:
     """
     Compute haplotypes for each unique allele combination in `deduped`.
 
@@ -182,7 +183,7 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
         if locus_info["coord_type"] == "aa":
             cols = _add_aa_haplotypes(deduped, source_id, region["meta"],
                                       query_ranges, cds_gff, ref_genome,
-                                      het_sep=het_sep, prefix=prefix)
+                                      het_sep=het_sep, prefix=prefix, mode=mode)
         else:
             cols = _add_nt_haplotypes(deduped, source_id, region["meta"],
                                       query_ranges, locus_info["intervals"], ref_genome,
@@ -203,9 +204,12 @@ def _range_col_name(source_id: str, start: int, end: int) -> str:
     return f"{source_id}_{start}" if start == end else f"{source_id}_{start}_{end}"
 
 
+_MAX_PER_POS_COLS = 50  # skip individual-position columns for very wide queries
+
+
 def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                        cds_gff, ref_genome, het_sep: str = "/",
-                       prefix: str | None = None) -> dict:
+                       prefix: str | None = None, mode: str = "default") -> dict:
     cds_result = _build_ref_cds(source_id, cds_gff, ref_genome)
     if cds_result is None:
         return {}
@@ -242,7 +246,11 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
         for aa_start, aa_end in aa_ranges
         for aa_pos in range(aa_start, aa_end + 1)
     })
-    per_pos_lists: dict[str, list] = {f"{col_prefix}_{p}": [] for p in all_aa_positions}
+    # Skip individual-position columns for very wide (e.g. full-gene) queries
+    _gen_per_pos = len(all_aa_positions) <= _MAX_PER_POS_COLS
+    per_pos_lists: dict[str, list] = (
+        {f"{col_prefix}_{p}": [] for p in all_aa_positions} if _gen_per_pos else {}
+    )
 
     haplotypes     = []
     ns_changes_col = []
@@ -291,9 +299,20 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     else:
                         chars.append(_aa_at(alt_aa, aa_p))
                 hap_parts.append("".join(chars))
+            elif has_ordered and mode in ("default", "wide"):
+                # Build char-by-char: het positions show [major/minor]
+                chars = []
+                for aa_p in range(aa_start, aa_end + 1):
+                    cvars = aa_to_pos.get(aa_p, [])
+                    if any(p in ordered_pos for p in cvars):
+                        aa_m = _aa_at(alt_aa_major, aa_p)
+                        aa_n = _aa_at(alt_aa_minor, aa_p)
+                        chars.append(f"[{aa_m}/{aa_n}]" if aa_m != aa_n else aa_m)
+                    else:
+                        chars.append(_aa_at(alt_aa, aa_p))
+                hap_parts.append("".join(chars))
             elif has_het or has_ordered or has_multi:
-                # ordered/het ranges collapse to "*" in the haplotype summary;
-                # per-position columns still show the "S/A" breakdown.
+                # skip/collapse modes: collapse the whole range to "*"
                 hap_parts.append(HET_SYMBOL)
             else:
                 hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end)
@@ -323,8 +342,8 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                 elif ref_a != alt_a:
                     ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
 
-        # Per-individual-position columns
-        for aa_pos in all_aa_positions:
+        # Per-individual-position columns (skipped when _gen_per_pos is False)
+        for aa_pos in (all_aa_positions if _gen_per_pos else []):
             col_name    = f"{col_prefix}_{aa_pos}"
             codon_vars  = aa_to_pos.get(aa_pos, [])
             pos_alleles = [alleles_here.get(p) for p in codon_vars]

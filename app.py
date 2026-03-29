@@ -7,7 +7,7 @@ import streamlit as st
 
 from src.utils import (
     build_chunk_index, load_reference_files, load_variant_data,
-    parse_loci_from_input, resolve_loci, build_regions,
+    parse_loci_from_input, expand_full_gene_loci, resolve_loci, build_regions,
     build_variant_rows, load_call_data, build_allele_matrix,
 )
 from src.haplotypes import deduplicate_allele_matrix, compute_haplotypes
@@ -25,27 +25,18 @@ def _make_per_sample_tsv(raw: pd.DataFrame) -> str:
     )
 
 
-_NS_ENTRY_RE = re.compile(r'^([A-Za-z?])(\d+)([A-Za-z*\-])$')
+_NS_HET_RE = re.compile(r'^([A-Za-z?])(\d+)([A-Za-z*\-])\/([A-Za-z*\-])$')
 
 
-def _expand_ns_entry(entry: str, het_sep: str) -> list[str]:
-    """Split a het entry like 'R371R/I' into ['R371R', 'R371I']; pass-through otherwise."""
-    if het_sep not in entry:
-        return [entry]
-    major_part, minor_aa = entry.split(het_sep, 1)
-    m = _NS_ENTRY_RE.match(major_part)
-    if m:
-        ref_aa, pos = m.group(1), m.group(2)
-        return [major_part, f"{ref_aa}{pos}{minor_aa}"]
-    return [entry]
+def _format_ns_changes(val, mode: str) -> str:
+    """Format an ns_changes cell (list or str repr) for display.
 
-
-def _format_ns_entry_lower(entry: str) -> str:
-    return entry.lower()
-
-
-def _format_ns_changes(val, mode: str, het_sep: str = "/") -> str:
-    """Format an ns_changes cell (list or str repr) for display."""
+    Modes:
+      default  – M56T/M  → M56[T/M],  joined with ", "
+      skip     – M56*    → M56*,       joined with ", "
+      collapse – M56T    → M56T,       joined with ", "
+      wide     – M56T/M  → M56T, M56M, joined with ", "
+    """
     if isinstance(val, list):
         changes = val
     else:
@@ -57,16 +48,18 @@ def _format_ns_changes(val, mode: str, het_sep: str = "/") -> str:
         return str(val)
     if not changes:
         return ""
-    if mode == "compact":
-        return "/".join(changes)
-    if mode == "lower":
-        parts = []
-        for c in changes:
-            for entry in _expand_ns_entry(c, het_sep):
-                parts.append(_format_ns_entry_lower(entry))
-        return ",".join(parts)
-    # default: Python list repr
-    return str(changes)
+
+    parts = []
+    for entry in changes:
+        m = _NS_HET_RE.match(entry)
+        if m and mode == "default":
+            parts.append(f"{m.group(1)}{m.group(2)}[{m.group(3)}/{m.group(4)}]")
+        elif m and mode == "wide":
+            parts.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
+            parts.append(f"{m.group(1)}{m.group(2)}{m.group(4)}")
+        else:
+            parts.append(entry)
+    return ", ".join(parts)
 
 st.set_page_config(layout="wide", page_title="Variant Marketplace", page_icon = "assets/logo.svg")
 
@@ -86,7 +79,7 @@ RAW_USER_INPUT = st.text_area(
     "Enter genomic loci",
     value="PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
     help=(
-        "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · "
+        "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · use `[*]` for the full gene · "
         "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
         "Optional alias: `PF3D7_0709000[72,74](crt)` → columns named `crt_72`, `crt_74` · "
         "Multiple loci separated by spaces."
@@ -94,6 +87,7 @@ RAW_USER_INPUT = st.text_area(
 )
 
 parsed_loci   = parse_loci_from_input(RAW_USER_INPUT)
+parsed_loci   = expand_full_gene_loci(parsed_loci, reference_files["cds_gff"])
 resolved_loci = resolve_loci(parsed_loci, reference_files["cds_gff"])
 
 if parsed_loci.empty:
@@ -204,42 +198,31 @@ st.caption(
 st.divider()
 st.subheader("Build haplotypes")
 
-_HET_LABELS = {
-    "Exclude and only use hom calls": "exclude",
-    "Use the major allele":           "major_ad",
-    "Order alleles by depth":         "ordered_ad",
+_FORMAT_OPTS = {
+    "default  ·  -T,[T/M]GK  ·  G42-, K43T, M56[T/M], C58K":          "default",
+    "skip  ·  -T,*GK  ·  G42-, K43T, M56*, C58K  (faster, no AD)":    "skip",
+    "collapse  ·  -T,TGK  ·  G42-, K43T, M56T, C58K":                  "collapse",
+    "wide  ·  -T,[T/M]GK  ·  G42-, K43T, M56T, M56M, C58K":           "wide",
 }
-het_mode_label = st.radio(
-    "How to handle heterozygous genotypes when computing haplotypes:",
-    list(_HET_LABELS.keys()),
-    horizontal=True,
-)
-HET_MODE = _HET_LABELS[het_mode_label]
-
-if HET_MODE == "ordered_ad":
-    het_sep_label = st.radio(
-        "Separate het alleles with:",
-        ["/ (forward slash)", ", (comma)"],
-        horizontal=True,
-        help="How paired major/minor alleles are joined in output columns",
-    )
-    HET_SEP = "," if "(comma)" in het_sep_label else "/"
-else:
-    HET_SEP = "/"
-
-_NS_FORMAT_OPTS = {
-    "List  ['N462A', 'G928W']": "list",
-    "Compact  N462A/G928W":     "compact",
-    "Lowercase  n86n,n86y":     "lower",
-}
-_ns_mode = _NS_FORMAT_OPTS[st.radio(
-    "ns_changes format",
-    list(_NS_FORMAT_OPTS.keys()),
-    horizontal=True,
+FORMAT_MODE = _FORMAT_OPTS[st.radio(
+    "Haplotype format",
+    list(_FORMAT_OPTS.keys()),
+    horizontal=False,
+    help=(
+        "**default** – het positions shown as [major/minor] ordered by allele depth · "
+        "**skip** – hets shown as * (no AD loaded, faster) · "
+        "**collapse** – het resolved to major allele · "
+        "**wide** – het positions expanded to two separate ns_changes entries"
+    ),
 )]
 
+_HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
+                 "collapse": "major_ad",   "wide": "ordered_ad"}
+HET_MODE = _HET_MODE_MAP[FORMAT_MODE]
+HET_SEP  = "/"
+
 # Small state management section
-_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, HET_MODE, HET_SEP)
+_load_state = (RAW_USER_INPUT, apply_filter_pass, apply_numalt1, FORMAT_MODE)
 if st.session_state.get("last_load_state") != _load_state:
     st.session_state["last_load_state"]    = _load_state
     st.session_state["haplotypes_built"]   = False
@@ -293,7 +276,7 @@ else:
         progress.progress((n_regions + 1) / n_steps, text="Computing haplotypes…")
         raw = compute_haplotypes(
             deduped, regions, resolved_loci, parsed_loci,
-            reference_files["cds_gff"], het_sep=HET_SEP,
+            reference_files["cds_gff"], het_sep=HET_SEP, mode=FORMAT_MODE,
         )
         progress.progress(1.0, text="Done!")
         progress.empty()
@@ -316,7 +299,7 @@ else:
     display_raw = raw.copy()
     for _c in ns_cols:
         display_raw[_c] = display_raw[_c].apply(
-            lambda v: _format_ns_changes(v, _ns_mode, HET_SEP)
+            lambda v: _format_ns_changes(v, FORMAT_MODE)
         )
 
     # ── Auto-download on first render after computation, then show button ──────

@@ -107,6 +107,10 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
             part = part.strip()
             if not part:
                 continue
+            if part == "*":
+                # Wildcard: full gene — resolved later by expand_full_gene_loci
+                rows.append((identifier, 0, 0, coord_type, alias))
+                continue
             if "-" in part:
                 start, end = part.split("-", 1)
                 rows.append((identifier, int(start.strip()), int(end.strip()), coord_type, alias))
@@ -115,6 +119,37 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
                 rows.append((identifier, pos, pos, coord_type, alias))
 
     return pd.DataFrame(rows, columns=["chrom", "start", "end", "coord_type", "alias"])
+
+
+def _compute_gene_aa_length(gene_id: str, cds_gff: pd.DataFrame) -> int:
+    """Return the number of amino acids encoded by a gene's CDS."""
+    exons = cds_gff[cds_gff["gene_id"] == gene_id]
+    if exons.empty:
+        return 0
+    total_nt = sum(int(row["end"]) - int(row["start"]) + 1 for _, row in exons.iterrows())
+    return total_nt // 3
+
+
+def expand_full_gene_loci(parsed_loci: pd.DataFrame, cds_gff: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace wildcard rows (start == end == 0, coord_type == 'aa') with the
+    full AA range 1..n_aa by looking up the gene's CDS length in the GFF.
+    Rows that cannot be resolved are silently dropped.
+    """
+    if parsed_loci.empty:
+        return parsed_loci
+    out = []
+    for _, row in parsed_loci.iterrows():
+        if row["coord_type"] == "aa" and row["start"] == 0 and row["end"] == 0:
+            n_aa = _compute_gene_aa_length(str(row["chrom"]), cds_gff)
+            if n_aa > 0:
+                out.append({**row.to_dict(), "start": 1, "end": n_aa})
+            # else: gene not in GFF — skip silently
+        else:
+            out.append(row.to_dict())
+    if not out:
+        return pd.DataFrame(columns=parsed_loci.columns)
+    return pd.DataFrame(out, columns=parsed_loci.columns).reset_index(drop=True)
 
 
 def _aa_to_genomic_intervals(gene_id: str, aa_start: int, aa_end: int,
