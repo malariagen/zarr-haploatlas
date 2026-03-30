@@ -21,6 +21,12 @@ HAPLOTYPES_DIR = "haplotypes"
 _TOKEN_RE = re.compile(r'([^\s\[]+\[[^\]]+\](?:\([^)]+\))?)')
 
 
+def _job_log(message: str) -> None:
+    """Print short timestamped progress messages from background jobs."""
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[order-job {ts}] {message}", flush=True)
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_per_sample_df(raw: pd.DataFrame) -> pd.DataFrame:
@@ -116,15 +122,18 @@ def _run_build_job(
     apply_numalt1: bool,
 ):
     try:
+        _job_log(f"Build started for {len(tokens)} token(s); format={format_mode}.")
         for i, token in enumerate(tokens):
             if job_state["cancel"]:
                 job_state["status"] = "cancelled"
+                _job_log("Build cancelled by user.")
                 return
 
             job_state["current_i"] = i
             job_state["tokens"][i]["state"] = "running"
             job_state["progress"] = 0.0
             job_state["progress_text"] = "Parsing locus…"
+            _job_log(f"[{i+1}/{len(tokens)}] Processing {token}")
 
             parsed_t   = parse_loci_from_input(token)
             parsed_t   = expand_full_gene_loci(parsed_t, reference_files["cds_gff"])
@@ -134,6 +143,7 @@ def _run_build_job(
                 job_state["tokens"][i]["state"]    = "skipped"
                 job_state["tokens"][i]["path"]     = None
                 job_state["tokens"][i]["warnings"] = [f"Could not resolve `{token}` — skipping."]
+                _job_log(f"[{i+1}/{len(tokens)}] Skipped: could not resolve token.")
                 continue
 
             regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
@@ -142,15 +152,18 @@ def _run_build_job(
             if not regions_t:
                 job_state["tokens"][i]["state"] = "skipped"
                 job_state["tokens"][i]["path"]  = None
+                _job_log(f"[{i+1}/{len(tokens)}] Skipped: no regions/variants found.")
                 continue
 
             rids    = list(regions_t.keys())
             n_r     = len(rids)
             n_steps = n_r + 2
+            _job_log(f"[{i+1}/{len(tokens)}] Resolved {n_r} region(s); loading calls.")
 
             for j, sid in enumerate(rids):
                 if job_state["cancel"]:
                     job_state["status"] = "cancelled"
+                    _job_log("Build cancelled by user.")
                     return
                 job_state["progress"]      = j / n_steps
                 job_state["progress_text"] = f"Loading {sid}…"
@@ -164,6 +177,7 @@ def _run_build_job(
 
             if job_state["cancel"]:
                 job_state["status"] = "cancelled"
+                _job_log("Build cancelled by user.")
                 return
 
             job_state["progress"]      = n_r / n_steps
@@ -196,14 +210,17 @@ def _run_build_job(
             job_state["tokens"][i]["path"]  = fpath
             job_state["progress"]           = 1.0
             job_state["progress_text"]      = "Done"
+            _job_log(f"[{i+1}/{len(tokens)}] Saved {fpath}")
 
         job_state["status"]    = "done"
         job_state["current_i"] = None
         job_state["progress"]  = None
+        _job_log("Build completed.")
 
     except Exception as exc:
         job_state["status"] = "error"
         job_state["error"]  = str(exc)
+        _job_log(f"Build failed: {exc}")
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
