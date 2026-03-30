@@ -275,7 +275,7 @@ _fmt_sel = st.dataframe(
     _FORMAT_DF,
     key="order_fmt_selection",
     hide_index=True,
-    use_container_width=True,
+    width="stretch",
     on_select="rerun",
     selection_mode="single-row",
 )

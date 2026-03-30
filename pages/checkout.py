@@ -85,7 +85,7 @@ st.subheader(f"Available files ({len(tsv_files)})")
 selection = st.dataframe(
     files_df,
     hide_index=True,
-    use_container_width=True,
+    width="stretch",
     on_select="rerun",
     selection_mode="multi-row",
     column_config={
@@ -185,7 +185,7 @@ if _merge_ready:
         f"{merged.shape[0]:,} samples × {merged.shape[1]} columns"
         + (f" merged from {n_sel} files" if n_sel > 1 else "")
     )
-    st.dataframe(merged, hide_index=True, use_container_width=True)
+    st.dataframe(merged, hide_index=True, width="stretch")
 
     tsv_out = merged.to_csv(sep="\t", index=False)
     st.download_button(
