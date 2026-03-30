@@ -7,6 +7,12 @@ import datetime
 import pandas as pd
 import streamlit as st
 
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except Exception:  # pragma: no cover
+    add_script_run_ctx = None
+    get_script_run_ctx = None
+
 from src.utils import (
     build_chunk_index, load_reference_files, load_variant_data,
     parse_loci_from_input, expand_full_gene_loci, resolve_loci, build_regions,
@@ -452,7 +458,7 @@ def render():
                     },
                 }
                 st.session_state["order_job_state"] = new_job
-                threading.Thread(
+                worker = threading.Thread(
                     target=_run_build_job,
                     args=(
                         new_job, tokens, reference_files, variant_data,
@@ -461,7 +467,16 @@ def render():
                         apply_filter_pass, apply_numalt1,
                     ),
                     daemon=True,
-                ).start()
+                )
+
+                # If available, bind Streamlit context so cached/data APIs invoked
+                # in the worker thread don't emit ScriptRunContext warnings.
+                if add_script_run_ctx and get_script_run_ctx:
+                    ctx = get_script_run_ctx()
+                    if ctx is not None:
+                        add_script_run_ctx(worker, ctx)
+
+                worker.start()
                 st.rerun()
         else:
             st.caption("Select a format strategy above to enable building.")
