@@ -100,7 +100,7 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
         identifier, pos_part = token_body.split("[", 1)
         pos_part = pos_part.rstrip("]")
 
-        is_gene    = bool(re.match(r"^PF3D7_\d{7}$", identifier, re.IGNORECASE))
+        is_gene    = bool(re.match(r"^PF3D7_(?:\d{7}|(?:MIT|API)\d{5})$", identifier, re.IGNORECASE))
         coord_type = "aa" if is_gene else "nt"
 
         for part in pos_part.split(","):
