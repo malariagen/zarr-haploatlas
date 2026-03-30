@@ -2,7 +2,6 @@ import ast
 import hashlib
 import os
 import re
-import time
 import threading
 import datetime
 import pandas as pd
@@ -99,216 +98,8 @@ def _format_ns_changes(val, mode: str) -> str:
     return ", ".join(parts)
 
 
-# ── Page ──────────────────────────────────────────────────────────────────────
-
-st.title("Order Haplotypes", anchor=False)
-
-chunk_index_df  = build_chunk_index()
-reference_files = load_reference_files()
-variant_data    = load_variant_data()
-
-# ── Initialise widget defaults once — never rely on value= to re-set these ───
-# Streamlit can re-apply value= on every render in some versions, which would
-# overwrite the user's in-session changes and corrupt the settings hash.
-_WIDGET_DEFAULTS: dict = {
-    "order_debug":        False,
-    "order_loci_input":   "PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
-    "order_filter_pass":  False,
-    "order_numalt":       False,
-}
-for _k, _v in _WIDGET_DEFAULTS.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-DEBUG = st.toggle("Debug mode", key="order_debug")
-
-RAW_USER_INPUT = st.text_area(
-    "Enter genomic loci",
-    key="order_loci_input",
-    help=(
-        "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · use `[*]` for the full gene · "
-        "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
-        "Optional alias: `PF3D7_0709000[72,74](crt)` → columns named `crt_72`, `crt_74` · "
-        "Multiple loci separated by spaces. Each bracket expression becomes one file."
-    ),
-)
-
-# Parse all loci together for the variant overview table.
-# Per-token parsing happens inside the build loop.
-parsed_loci   = parse_loci_from_input(RAW_USER_INPUT)
-parsed_loci   = expand_full_gene_loci(parsed_loci, reference_files["cds_gff"])
-resolved_loci = resolve_loci(parsed_loci, reference_files["cds_gff"])
-
-# Individual token strings — one file will be saved per token.
-_tokens = _TOKEN_RE.findall(RAW_USER_INPUT)
-
-if parsed_loci.empty:
-    st.info("Enter one or more loci above to begin.")
-    st.stop()
-
-if DEBUG:
-    with st.expander("Debug"):
-        st.write("**Chunk index**")
-        st.dataframe(chunk_index_df, width="stretch", hide_index=True)
-        st.write("**Parsed loci (all tokens combined):**")
-        st.dataframe(parsed_loci, width="stretch", hide_index=True)
-        st.write("**Resolved genomic intervals:**")
-        for sid, info in resolved_loci.items():
-            st.text(f"{sid} ({info['coord_type']}): {info['intervals']}")
-        st.write(f"**Tokens ({len(_tokens)}):** {_tokens}")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. Variant metadata table (all tokens combined for overview)
-# ══════════════════════════════════════════════════════════════════════════════
-
-regions, warnings = build_regions(resolved_loci, variant_data, chunk_index_df)
-for w in warnings:
-    st.warning(w)
-
-if not regions:
-    st.warning("No variants found for any queried locus.")
-    st.stop()
-
-st.divider()
-st.subheader("Overview of variants of interest")
-
-meta_rows = []
-for source_id, region in regions.items():
-    meta_rows.extend(build_variant_rows(source_id, region["meta"], resolved_loci[source_id]))
-
-meta_df    = pd.DataFrame(meta_rows)
-n_samples  = next(iter(regions.values()))["meta"]["n_samples"]
-total_vars = sum(r["meta"]["n_variants"] for r in regions.values())
-
-fcol1, fcol2, _ = st.columns(3)
-apply_filter_pass = fcol1.toggle(
-    "Filter pass variants only",
-    key="order_filter_pass",
-    help="Exclude variants that do not pass quality filters",
-)
-apply_numalt1 = fcol2.toggle(
-    "Biallelic variants only",
-    key="order_numalt",
-    help="Exclude multi-allelic variant sites",
-)
-
-fail_fp  = ~meta_df["filter_pass"] if apply_filter_pass else pd.Series(False, index=meta_df.index)
-fail_na  = (meta_df["numalt"] != 1) if apply_numalt1    else pd.Series(False, index=meta_df.index)
-fail_any = fail_fp | fail_na
-
-excluded_positions: set[str] = {
-    str(meta_df.loc[i, "position"]) for i in meta_df.index if fail_any.loc[i]
-}
-
-_BOOL_COLS = ["is_snp", "filter_pass", "CDS", "needs_translation"]
-
-def _highlight_failed(row):
-    color = "background-color: #ffcccc" if fail_any.loc[row.name] else ""
-    return [color] * len(row)
-
-def _color_bool(val):
-    if val == "✓": return "color: #2d8a4e"
-    if val == "✗": return "color: #cc3333"
-    return ""
-
-display_meta = meta_df.copy()
-for col in _BOOL_COLS:
-    if col in display_meta.columns:
-        display_meta[col] = display_meta[col].map({True: "✓", False: "✗"})
-
-st.dataframe(
-    display_meta.style.apply(_highlight_failed, axis=1).map(_color_bool, subset=_BOOL_COLS),
-    hide_index=True,
-    width="stretch",
-    column_config={"alt": st.column_config.ListColumn("alt alleles"), "numalt": None, "ref_len": None},
-)
-st.caption(
-    f"{total_vars} variant sites across {len(regions)} {'locus' if len(regions) == 1 else 'loci'}, "
-    f"affecting {n_samples:,} samples."
-    + (" Rows highlighted in red are excluded from downstream steps." if fail_any.any() else ""),
-    text_alignment="right",
-)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Haplotype build
-# ══════════════════════════════════════════════════════════════════════════════
-st.divider()
-st.subheader("Build haplotypes")
-
-_FORMAT_DF = pd.DataFrame([
-    {
-        "format strategy": "default",
-        "description": "Show both alleles at het positions with the major allele first",
-        "speed": "slower",
-        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
-        "format of '_haplotype' column": "-T,[T/M]GK",
-        "format of '_ns_changes' column": "G42-, K43T, M56[T/M], C58K",
-    }, {
-        "format strategy": "skip",
-        "description": "Skip processing hets and mark as #",
-        "speed": "faster",
-        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "#",
-        "format of '_haplotype' column": "-T,#GK",
-        "format of '_ns_changes' column": "G42-, K43T, M56#, C58K",
-    }, {
-        "format strategy": "collapse",
-        "description": "Resolve het to hom using the major allele",
-        "speed": "slower",
-        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
-        "format of '_haplotype' column": "-T,TGK",
-        "format of '_ns_changes' column": "G42-, K43T, M56T, C58K",
-    }, {
-        "format strategy": "wide",
-        "description": "Expand het positions to two separate ns_changes entries",
-        "speed": "slower",
-        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
-        "format of '_haplotype' column": "-T,[T/M]GK",
-        "format of '_ns_changes' column": "G42-, K43T, M56T, M56M, C58K",
-    },
-])
-
-st.caption(
-    "Imagine you queried `PF3D7_XXXXXXX[42-43, 56-58]` and a sample had: "
-    "G42- (missing), K43T, M56[T/M], wild type G57, C58K — "
-    "how would you like the output formatted?"
-)
-_fmt_sel = st.dataframe(
-    _FORMAT_DF,
-    key="order_fmt_selection",
-    hide_index=True,
-    width="stretch",
-    on_select="rerun",
-    selection_mode="single-row",
-)
-_selected_rows = _fmt_sel.selection.rows
-if _selected_rows:
-    # User made (or restored) a selection — update the persisted value.
-    FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"]
-    st.session_state["order_fmt_mode"] = FORMAT_MODE
-else:
-    # No selection visible (e.g. first render or selection lost on navigation) —
-    # fall back to whatever was last explicitly chosen, defaulting to "default".
-    FORMAT_MODE = st.session_state.get("order_fmt_mode", "default")
-
-_HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
-                 "collapse": "major_ad",   "wide": "ordered_ad"}
-HET_MODE = _HET_MODE_MAP[FORMAT_MODE]
-HET_SEP  = "/"
-
-# ── Settings hash — invalidates per-token cache when any input changes ────────
-_settings_hash = hashlib.md5(
-    repr((RAW_USER_INPUT, apply_filter_pass, apply_numalt1, FORMAT_MODE)).encode()
-).hexdigest()[:16]
-
-if st.session_state.get("order_settings_hash") != _settings_hash:
-    existing_job = st.session_state.get("order_job_state")
-    if existing_job is not None:
-        existing_job["cancel"] = True   # signal any running thread to stop
-    st.session_state.pop("order_job_state", None)
-    st.session_state["order_settings_hash"] = _settings_hash
-
 # ── Background build job ──────────────────────────────────────────────────────
-# Runs in a daemon thread so navigation away from this page doesn't stop it.
+# Runs in a daemon thread so tab switches don't interrupt it.
 # Must not call any st.* function — communicates only via the job_state dict.
 
 def _run_build_job(
@@ -415,18 +206,221 @@ def _run_build_job(
         job_state["error"]  = str(exc)
 
 
-# ── Build section (fragment: st.rerun() here only re-runs this block, ─────────
-# ── leaving the loci input, variant table, and format selector untouched) ─────
-@st.fragment
-def _build_section():
+# ── Page ──────────────────────────────────────────────────────────────────────
+
+def render():
+    st.title("Order Haplotypes", anchor=False)
+
+    chunk_index_df  = build_chunk_index()
+    reference_files = load_reference_files()
+    variant_data    = load_variant_data()
+
+    # ── Widget defaults ────────────────────────────────────────────────────────
+    for _k, _v in {
+        "order_debug":        False,
+        "order_loci_input":   "PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
+        "order_filter_pass":  False,
+        "order_numalt":       False,
+    }.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    DEBUG = st.toggle("Debug mode", key="order_debug")
+
+    RAW_USER_INPUT = st.text_area(
+        "Enter genomic loci",
+        key="order_loci_input",
+        help=(
+            "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · use `[*]` for the full gene · "
+            "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
+            "Optional alias: `PF3D7_0709000[72,74](crt)` → columns named `crt_72`, `crt_74` · "
+            "Multiple loci separated by spaces. Each bracket expression becomes one file."
+        ),
+    )
+
+    # Parse all loci together for the variant overview table.
+    # Per-token parsing happens inside the build loop.
+    parsed_loci   = parse_loci_from_input(RAW_USER_INPUT)
+    parsed_loci   = expand_full_gene_loci(parsed_loci, reference_files["cds_gff"])
+    resolved_loci = resolve_loci(parsed_loci, reference_files["cds_gff"])
+
+    # Individual token strings — one file will be saved per token.
+    tokens = _TOKEN_RE.findall(RAW_USER_INPUT)
+
+    if parsed_loci.empty:
+        st.info("Enter one or more loci above to begin.")
+        return
+
+    if DEBUG:
+        with st.expander("Debug"):
+            st.write("**Chunk index**")
+            st.dataframe(chunk_index_df, width="stretch", hide_index=True)
+            st.write("**Parsed loci (all tokens combined):**")
+            st.dataframe(parsed_loci, width="stretch", hide_index=True)
+            st.write("**Resolved genomic intervals:**")
+            for sid, info in resolved_loci.items():
+                st.text(f"{sid} ({info['coord_type']}): {info['intervals']}")
+            st.write(f"**Tokens ({len(tokens)}):** {tokens}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 1. Variant metadata table (all tokens combined for overview)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    regions, warnings = build_regions(resolved_loci, variant_data, chunk_index_df)
+    for w in warnings:
+        st.warning(w)
+
+    if not regions:
+        st.warning("No variants found for any queried locus.")
+        return
+
+    st.divider()
+    st.subheader("Overview of variants of interest")
+
+    meta_rows = []
+    for source_id, region in regions.items():
+        meta_rows.extend(build_variant_rows(source_id, region["meta"], resolved_loci[source_id]))
+
+    meta_df    = pd.DataFrame(meta_rows)
+    n_samples  = next(iter(regions.values()))["meta"]["n_samples"]
+    total_vars = sum(r["meta"]["n_variants"] for r in regions.values())
+
+    fcol1, fcol2, _ = st.columns(3)
+    apply_filter_pass = fcol1.toggle(
+        "Filter pass variants only",
+        key="order_filter_pass",
+        help="Exclude variants that do not pass quality filters",
+    )
+    apply_numalt1 = fcol2.toggle(
+        "Biallelic variants only",
+        key="order_numalt",
+        help="Exclude multi-allelic variant sites",
+    )
+
+    fail_fp  = ~meta_df["filter_pass"] if apply_filter_pass else pd.Series(False, index=meta_df.index)
+    fail_na  = (meta_df["numalt"] != 1) if apply_numalt1    else pd.Series(False, index=meta_df.index)
+    fail_any = fail_fp | fail_na
+
+    excluded_positions: set[str] = {
+        str(meta_df.loc[i, "position"]) for i in meta_df.index if fail_any.loc[i]
+    }
+
+    _BOOL_COLS = ["is_snp", "filter_pass", "CDS", "needs_translation"]
+
+    def _highlight_failed(row):
+        color = "background-color: #ffcccc" if fail_any.loc[row.name] else ""
+        return [color] * len(row)
+
+    def _color_bool(val):
+        if val == "✓":
+            return "color: #2d8a4e"
+        if val == "✗":
+            return "color: #cc3333"
+        return ""
+
+    display_meta = meta_df.copy()
+    for col in _BOOL_COLS:
+        if col in display_meta.columns:
+            display_meta[col] = display_meta[col].map({True: "✓", False: "✗"})
+
+    st.dataframe(
+        display_meta.style.apply(_highlight_failed, axis=1).map(_color_bool, subset=_BOOL_COLS),
+        hide_index=True,
+        width="stretch",
+        column_config={"alt": st.column_config.ListColumn("alt alleles"), "numalt": None, "ref_len": None},
+    )
+    st.caption(
+        f"{total_vars} variant sites across {len(regions)} {'locus' if len(regions) == 1 else 'loci'}, "
+        f"affecting {n_samples:,} samples."
+        + (" Rows highlighted in red are excluded from downstream steps." if fail_any.any() else ""),
+        text_alignment="right",
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 2. Haplotype build
+    # ══════════════════════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("Build haplotypes")
+
+    _FORMAT_DF = pd.DataFrame([
+        {
+            "format strategy": "default",
+            "description": "Show both alleles at het positions with the major allele first",
+            "speed": "slower",
+            "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+            "format of '_haplotype' column": "-T,[T/M]GK",
+            "format of '_ns_changes' column": "G42-, K43T, M56[T/M], C58K",
+        }, {
+            "format strategy": "skip",
+            "description": "Skip processing hets and mark as #",
+            "speed": "faster",
+            "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "#",
+            "format of '_haplotype' column": "-T,#GK",
+            "format of '_ns_changes' column": "G42-, K43T, M56#, C58K",
+        }, {
+            "format strategy": "collapse",
+            "description": "Resolve het to hom using the major allele",
+            "speed": "slower",
+            "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+            "format of '_haplotype' column": "-T,TGK",
+            "format of '_ns_changes' column": "G42-, K43T, M56T, C58K",
+        }, {
+            "format strategy": "wide",
+            "description": "Expand het positions to two separate ns_changes entries",
+            "speed": "slower",
+            "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+            "format of '_haplotype' column": "-T,[T/M]GK",
+            "format of '_ns_changes' column": "G42-, K43T, M56T, M56M, C58K",
+        },
+    ])
+
+    st.caption(
+        "Imagine you queried `PF3D7_XXXXXXX[42-43, 56-58]` and a sample had: "
+        "G42- (missing), K43T, M56[T/M], wild type G57, C58K — "
+        "how would you like the output formatted?"
+    )
+    _fmt_sel = st.dataframe(
+        _FORMAT_DF,
+        key="order_fmt_selection",
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+    _selected_rows = _fmt_sel.selection.rows
+    if _selected_rows:
+        FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"]
+        st.session_state["order_fmt_mode"] = FORMAT_MODE
+    else:
+        FORMAT_MODE = st.session_state.get("order_fmt_mode", "default")
+
+    _HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
+                     "collapse": "major_ad",   "wide": "ordered_ad"}
+    HET_MODE = _HET_MODE_MAP[FORMAT_MODE]
+    HET_SEP  = "/"
+
+    # ── Settings hash — cancel any running job when inputs change ─────────────
+    _settings_hash = hashlib.md5(
+        repr((RAW_USER_INPUT, apply_filter_pass, apply_numalt1, FORMAT_MODE)).encode()
+    ).hexdigest()[:16]
+
+    if st.session_state.get("order_settings_hash") != _settings_hash:
+        existing_job = st.session_state.get("order_job_state")
+        if existing_job is not None:
+            existing_job["cancel"] = True
+        st.session_state.pop("order_job_state", None)
+        st.session_state["order_settings_hash"] = _settings_hash
+
+    # ── Build controls ─────────────────────────────────────────────────────────
     job_state: dict | None = st.session_state.get("order_job_state")
 
-    # ── No active job — show start button ─────────────────────────────────────
     if job_state is None:
-        n_tok = len(_tokens)
-        label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
+        n_tok = len(tokens)
         if _selected_rows:
-            if st.button(label, type="primary"):
+            if st.button(
+                f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})",
+                type="primary",
+            ):
                 new_job: dict = {
                     "cancel":        False,
                     "n_tokens":      n_tok,
@@ -444,26 +438,26 @@ def _build_section():
                 threading.Thread(
                     target=_run_build_job,
                     args=(
-                        new_job, _tokens, reference_files, variant_data,
+                        new_job, tokens, reference_files, variant_data,
                         chunk_index_df, excluded_positions,
                         HET_MODE, HET_SEP, FORMAT_MODE,
                         apply_filter_pass, apply_numalt1,
                     ),
                     daemon=True,
                 ).start()
-                st.rerun(scope="fragment")
+                st.rerun()
         else:
             st.caption("Select a format strategy above to enable building.")
         return
 
-    # ── Job exists — render per-token status ──────────────────────────────────
+    # ── Render per-token status ────────────────────────────────────────────────
     n_tokens = job_state["n_tokens"]
     status   = job_state["status"]
 
     for i in range(n_tokens):
-        tok      = job_state["tokens"].get(i, {})
-        state    = tok.get("state", "pending")
-        label    = f"({i+1}/{n_tokens}) `{_tokens[i]}`"
+        tok   = job_state["tokens"].get(i, {})
+        state = tok.get("state", "pending")
+        label = f"({i+1}/{n_tokens}) `{tokens[i]}`"
 
         for w in tok.get("warnings", []):
             st.warning(w)
@@ -486,12 +480,11 @@ def _build_section():
                 st.info(f"Building {label}…")
         # pending: no output — avoids cluttering the UI before a token starts
 
-    # ── Terminal states ────────────────────────────────────────────────────────
     if status == "done":
         if st.button("Build new haplotypes"):
             st.session_state.pop("order_job_state", None)
             st.session_state.pop("order_fmt_mode", None)
-            st.rerun(scope="fragment")
+            st.rerun()
         return
 
     if status in ("cancelled", "error"):
@@ -501,17 +494,13 @@ def _build_section():
             st.error(f"Build error: {job_state.get('error')}")
         if st.button("Dismiss"):
             st.session_state.pop("order_job_state", None)
-            st.rerun(scope="fragment")
+            st.rerun()
         return
 
-    # ── Still running — cancel button + polling rerun ─────────────────────────
-    if st.button("Cancel build"):
-        job_state["cancel"] = True
-        st.rerun(scope="fragment")
-        return
-
-    time.sleep(0.5)
-    st.rerun(scope="fragment")
-
-
-_build_section()
+    # Running: if cancel was already requested show feedback; otherwise offer button.
+    if job_state.get("cancel"):
+        st.warning("Cancelling…")
+    else:
+        if st.button("Cancel build"):
+            job_state["cancel"] = True
+            st.rerun()
