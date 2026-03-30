@@ -204,6 +204,14 @@ def _range_col_name(source_id: str, start: int, end: int) -> str:
     return f"{source_id}_{start}" if start == end else f"{source_id}_{start}_{end}"
 
 
+def _pos_summary(ranges: list[tuple[int, int]]) -> str:
+    """Compact position summary matching the output filename convention.
+
+    [(72, 76), (220, 220), (271, 271)] → "72-76.220.271"
+    """
+    return ".".join(f"{s}-{e}" if s != e else str(s) for s, e in ranges)
+
+
 _MAX_PER_POS_COLS = 50  # skip individual-position columns for very wide queries
 
 
@@ -360,7 +368,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             elif is_ordered:
                 aa_m = _aa_at(alt_aa_major, aa_pos)
                 aa_n = _aa_at(alt_aa_minor, aa_pos)
-                per_pos_lists[col_name].append(f"{aa_m}{het_sep}{aa_n}" if aa_m != aa_n else aa_m)
+                per_pos_lists[col_name].append(f"{aa_m},{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
                               if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
@@ -381,9 +389,10 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
         haplotypes.append(",".join(hap_parts))
         ns_changes_col.append(ns_list)  # store as actual list, not str
 
+    pos_sum = _pos_summary(aa_ranges)
     return {
-        f"{col_prefix}_haplotype":  haplotypes,
-        f"{col_prefix}_ns_changes": ns_changes_col,
+        f"{col_prefix}_{pos_sum}_haplotype":  haplotypes,
+        f"{col_prefix}_{pos_sum}_ns_changes": ns_changes_col,
         **per_pos_lists,
     }
 
@@ -462,17 +471,22 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
             if iv_ordered:
                 alt_major = _apply_variants(ref_iv, sorted_pos_info, alleles_major)
                 alt_minor = _apply_variants(ref_iv, sorted_pos_info, alleles_minor)
-                alt_seq   = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
+                # haplotype keeps het_sep ("/") to stay unambiguous with the "," interval separator
+                alt_seq_hap = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
+                alt_seq_col = f"{alt_major},{alt_minor}" if alt_major != alt_minor else alt_major
             else:
-                alt_seq = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
+                alt_seq_hap = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
+                alt_seq_col = alt_seq_hap
 
-            parts.append(alt_seq)
-            per_iv_lists[col_name].append(alt_seq)
+            parts.append(alt_seq_hap)
+            per_iv_lists[col_name].append(alt_seq_col)
 
         suffix = HET_SYMBOL if has_het else ""
         haplotypes.append(",".join(parts) + suffix)
 
+    range_source_for_summary = nt_ranges if nt_ranges else [(iv[1], iv[2]) for iv in intervals]
+    pos_sum = _pos_summary(range_source_for_summary)
     return {
-        f"{col_prefix}_haplotype": haplotypes,
+        f"{col_prefix}_{pos_sum}_haplotype": haplotypes,
         **per_iv_lists,
     }
