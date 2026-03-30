@@ -370,9 +370,15 @@ else:
                 for j, sid in enumerate(rids):
                     region = regions_t[sid]
                     progress.progress(j / n_steps, text=f"Loading {sid}…")
+                    # Include positions in the cache key: different tokens can query
+                    # the same chromosome at different position ranges, producing
+                    # different ds objects. Without positions, load_call_data would
+                    # return a stale cache hit from an earlier token and cause an
+                    # IndexError when the variant counts differ.
+                    _pos_key = tuple(region["meta"]["positions"].tolist())
                     region["genotypes"], region["g1_wins"] = load_call_data(
                         region["ds"],
-                        cache_key=(sid, apply_filter_pass, apply_numalt1),
+                        cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
                         load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
                     )
 
