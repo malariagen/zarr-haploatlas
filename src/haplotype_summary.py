@@ -4,7 +4,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from bokeh.embed import file_html
 from bokeh.layouts import column
-from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.models import ColumnDataSource, FactorRange, HoverTool
 from bokeh.palettes import Greys256
 from bokeh.plotting import figure
 from bokeh.resources import CDN
@@ -18,6 +18,39 @@ def _normalise_for_grouping(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
         .fillna("NA")
         .replace({"<NA>": "NA", "nan": "NA", "None": "NA"})
     )
+
+
+def _compact_mutation_label(mutation_key: str, alleles: list[str]) -> str:
+    position = mutation_key.split("_", 1)[1] if "_" in mutation_key else mutation_key
+    valid = [a for a in alleles if a not in ("", "NA")]
+    if not valid:
+        return position
+
+    parsed = valid
+    parsed = [p for p in parsed if isinstance(p, str)]
+    m = pd.Series(parsed).str.extract(r"^([A-Za-z*?\-]+)(\d+)([A-Za-z*?\-/]+)$")
+    if not m.empty and m.notna().all(axis=1).all():
+        refs = m[0].unique().tolist()
+        poss = m[1].unique().tolist()
+        if len(refs) == 1 and len(poss) == 1:
+            ref = refs[0]
+            pos = poss[0]
+            alts = sorted(m[2].unique().tolist())
+            if len(alts) == 1:
+                return f"{ref}{pos}{alts[0]}"
+            return f"{ref}{pos}[{'/'.join(alts)}]"
+
+    unique_vals = sorted(pd.unique(valid).tolist())
+    if len(unique_vals) == 1:
+        return str(unique_vals[0])
+    return f"{position}[{'/'.join(map(str, unique_vals))}]"
+
+
+def _hide_x_axis(plt) -> None:
+    plt.xaxis.major_label_text_font_size = "0pt"
+    plt.xaxis.major_tick_line_color = None
+    plt.xaxis.minor_tick_line_color = None
+    plt.xgrid.grid_line_color = None
 
 
 def _prepare_haplotype_summary_data(
@@ -111,11 +144,11 @@ def render_checkout_haplotype_summary(
         return
 
     hap_order = grouped["haplotype_id"].tolist()
+    shared_x = FactorRange(factors=hap_order)
 
     count_src = ColumnDataSource(grouped[["haplotype_id", "sample_count"]])
     count_fig = figure(
-        title="Haplotype sample counts",
-        x_range=hap_order,
+        x_range=shared_x,
         height=280,
         sizing_mode="stretch_width",
         tools="pan,wheel_zoom,reset,save",
@@ -123,8 +156,8 @@ def render_checkout_haplotype_summary(
     )
     count_fig.vbar(x="haplotype_id", top="sample_count", width=0.85, source=count_src, color="#5C80BC")
     count_fig.add_tools(HoverTool(tooltips=[("Haplotype", "@haplotype_id"), ("Samples", "@sample_count")]))
-    count_fig.xaxis.major_label_orientation = 1.0
     count_fig.yaxis.axis_label = "Number of samples"
+    _hide_x_axis(count_fig)
 
     figures = [count_fig]
 
@@ -141,11 +174,16 @@ def render_checkout_haplotype_summary(
             .sort_values(["pos_num", "position", "mut_order"])
         )
         y_order = mutation_order["mutation"].tolist()[::-1]
+
+        tick_labels = {}
+        for mut in y_order:
+            alleles = sub.loc[sub["mutation"] == mut, "allele"].astype(str).tolist()
+            tick_labels[mut] = _compact_mutation_label(mut, alleles)
+
         source = ColumnDataSource(sub)
 
         hm = figure(
-            title=f"{alias} mutations",
-            x_range=hap_order,
+            x_range=shared_x,
             y_range=y_order,
             height=max(220, 35 * len(y_order)),
             sizing_mode="stretch_width",
@@ -162,16 +200,6 @@ def render_checkout_haplotype_summary(
             line_color="#dddddd",
             fill_color=mapper,
         )
-        hm.text(
-            x="haplotype_id",
-            y="mutation",
-            text="allele",
-            source=source,
-            text_font_size="8pt",
-            text_align="center",
-            text_baseline="middle",
-            text_color="#1f1f1f",
-        )
         hm.add_tools(
             HoverTool(
                 tooltips=[
@@ -183,11 +211,10 @@ def render_checkout_haplotype_summary(
                 ]
             )
         )
-        hm.xaxis.major_label_orientation = 1.0
+        hm.yaxis.axis_label = alias
+        hm.yaxis.major_label_overrides = tick_labels
         hm.ygrid.grid_line_color = None
-        hm.xgrid.grid_line_color = None
-        hm.yaxis.axis_label = "Mutation"
-        hm.xaxis.axis_label = "Haplotype"
+        _hide_x_axis(hm)
 
         figures.append(hm)
 
