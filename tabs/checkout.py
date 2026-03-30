@@ -4,6 +4,8 @@ import datetime
 import pandas as pd
 import streamlit as st
 
+from src.haplotype_summary import render_checkout_haplotype_summary
+
 HAPLOTYPES_DIR = "haplotypes"
 
 # ── Filename parsing ──────────────────────────────────────────────────────────
@@ -56,6 +58,33 @@ def _parse_filename(fname: str) -> dict:
 def _safe_col_prefix(loci_raw: str) -> str:
     """Turn a raw loci string like 'crt_72.74' into a safe column prefix."""
     return re.sub(r'[^A-Za-z0-9]', '_', loci_raw)
+
+
+def _is_mutation_column(col_name: str) -> bool:
+    if col_name == "sample_id":
+        return False
+    if col_name.endswith("_haplotype") or col_name.endswith("_ns_changes"):
+        return False
+    if col_name.startswith("Unnamed"):
+        return False
+    if re.search(r"_(\d+)(?:_\d+)?(?:__.*)?$", col_name):
+        return True
+    return False
+
+
+def _candidate_geography_columns(df: pd.DataFrame) -> list[str]:
+    cols = []
+    for c in df.columns:
+        if c == "sample_id":
+            continue
+        if not pd.api.types.is_object_dtype(df[c]) and not pd.api.types.is_string_dtype(df[c]):
+            continue
+        if df[c].nunique(dropna=True) > 100:
+            continue
+        c_lower = c.lower()
+        if any(k in c_lower for k in ["pop", "country", "site", "region", "geo"]):
+            cols.append(c)
+    return cols
 
 
 # ── Page ─────────────────────────────────────────────────────────────────────
@@ -197,4 +226,57 @@ def render():
             tsv_out,
             file_name=download_name,
             mime="text/tab-separated-values",
+        )
+
+        st.divider()
+        st.subheader("Haplotype summary")
+        st.caption(
+            "Select mutation columns (for example `dhps_456`, `dhps_459`, `dhfr_724`) "
+            "to build haplotype combinations and visualise them as a Bokeh haplotype summary view."
+        )
+
+        mutation_candidates = [c for c in merged.columns if _is_mutation_column(c)]
+        if len(mutation_candidates) < 2:
+            st.info("Need at least two mutation-like columns in the merged data to plot a haplotype summary.")
+            return
+
+        default_cols = mutation_candidates[: min(3, len(mutation_candidates))]
+        selected_mutation_cols = st.multiselect(
+            "Mutation columns",
+            options=mutation_candidates,
+            default=default_cols,
+            help="Each selected column is treated as one mutation row in the heatmap.",
+        )
+
+        geo_candidates = _candidate_geography_columns(merged)
+        geography_choice = st.selectbox(
+            "Population/geography column (optional)",
+            options=["None", *geo_candidates],
+            index=0,
+            help="If selected, a stacked distribution panel is shown for each haplotype.",
+        )
+        geography_col = None if geography_choice == "None" else geography_choice
+
+        c1, c2 = st.columns(2)
+        min_samples = c1.number_input(
+            "Minimum samples per haplotype",
+            min_value=1,
+            max_value=100000,
+            value=1,
+            step=1,
+        )
+        max_haplotypes = c2.slider(
+            "Max haplotypes shown",
+            min_value=10,
+            max_value=150,
+            value=60,
+            step=5,
+        )
+
+        render_checkout_haplotype_summary(
+            merged_df=merged,
+            mutation_columns=selected_mutation_cols,
+            geography_column=geography_col,
+            min_samples=int(min_samples),
+            max_haplotypes=int(max_haplotypes),
         )
