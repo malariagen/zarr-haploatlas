@@ -310,15 +310,18 @@ if st.session_state.get("order_settings_hash") != _settings_hash:
 @st.fragment
 def _build_section():
     if not st.session_state.get("order_haplotypes_started"):
-        # Allow building if there's a live selection OR a previously persisted mode
-        # (the selection can be lost on navigation but FORMAT_MODE is still valid).
-        _fmt_chosen = bool(_selected_rows) or "order_fmt_mode" in st.session_state
-        if _fmt_chosen:
-            n_tok = len(_tokens)
-            label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
+        n_tok = len(_tokens)
+        label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
+        if _selected_rows:
             if st.button(label, type="primary"):
                 st.session_state["order_haplotypes_started"] = True
-                st.rerun()
+                st.rerun(scope="fragment")
+        elif "order_fmt_mode" in st.session_state:
+            # Selection was lost on navigation but the format choice is still valid.
+            st.caption(f"Format **{FORMAT_MODE}** retained from previous selection — select a row above to change.")
+            if st.button(label, type="primary"):
+                st.session_state["order_haplotypes_started"] = True
+                st.rerun(scope="fragment")
         else:
             st.caption("Select a format strategy above to enable building.")
         return
@@ -350,7 +353,7 @@ def _build_section():
         if parsed_t.empty or not resolved_t:
             st.warning(f"Could not resolve `{token}` — skipping.")
             st.session_state[f"order_token_{next_i}_path"] = None
-            st.rerun()
+            st.rerun(scope="fragment")
             return
 
         regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
@@ -360,7 +363,7 @@ def _build_section():
         if not regions_t:
             st.warning(f"No variants found for `{token}` — skipping.")
             st.session_state[f"order_token_{next_i}_path"] = None
-            st.rerun()
+            st.rerun(scope="fragment")
             return
 
         t0       = time.time()
@@ -410,7 +413,7 @@ def _build_section():
         progress.empty()
 
         st.session_state[f"order_token_{next_i}_path"] = fpath
-        st.rerun()  # fragment-only rerun — variant table and loci input stay still
+        st.rerun(scope="fragment")
 
     else:
         st.caption(
