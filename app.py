@@ -198,23 +198,44 @@ st.caption(
 st.divider()
 st.subheader("Build haplotypes")
 
-_FORMAT_OPTS = {
-    "default  ·  -T,[T/M]GK  ·  G42-, K43T, M56[T/M], C58K":          "default",
-    "skip  ·  -T,\*GK  ·  G42-, K43T, M56*, C58K  (faster, no AD)":    "skip",
-    "collapse  ·  -T,TGK  ·  G42-, K43T, M56T, C58K":                  "collapse",
-    "wide  ·  -T,[T/M]GK  ·  G42-, K43T, M56T, M56M, C58K":           "wide",
-}
-FORMAT_MODE = _FORMAT_OPTS[st.radio(
-    "Haplotype format",
-    list(_FORMAT_OPTS.keys()),
-    horizontal=True,
-    help=(
-        "**default** – het positions shown as [major/minor] ordered by allele depth · "
-        "**skip** – hets shown as * (no AD loaded, faster) · "
-        "**collapse** – het resolved to major allele · "
-        "**wide** – het positions expanded to two separate ns_changes entries"
-    ),
-)]
+_FORMAT_DF = pd.DataFrame([
+    {
+        "format strategy": "default",
+        "description": "Show both alleles at het positions with the major allele first",
+        "speed": "slower", "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+        "format of '_haplotype' column": "-T,[T/M]GK", "format of '_ns_changes' column": "G42-, K43T, M56[T/M], C58K"
+    },{   
+        "format strategy": "skip",
+        "description": "Skip processing hets and mark as *",
+        "speed": "faster", "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "*",
+        "format of '_haplotype' column": "-T,*GK", "format of '_ns_changes' column": "G42-, K43T, M56*, C58K"
+    },{
+        "format strategy": "collapse",
+        "description": "Resolve het to hom using the major allele",
+        "speed": "slower", "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+        "format of '_haplotype' column": "-T,TGK", "format of '_ns_changes' column": "G42-, K43T, M56T, C58K"
+    },{
+        "format strategy": "wide",
+        "description": "Expand het positions to two separate ns_changes entries",
+        "speed": "slower", "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
+        "format of '_haplotype' column": "-T,[T/M]GK",  "format of '_ns_changes' column": "G42-, K43T, M56T, M56M, C58K"
+    },
+])
+
+st.caption(
+    "Imagine you queried `PF3D7_XXXXXXX[42-43, 56-58]` and a sample had: "
+    "G42- (missing), K43T, M56[T/M], wild type G57, C58K — "
+    "how would you like the output formatted?"
+)
+_fmt_selection = st.dataframe(
+    _FORMAT_DF,
+    hide_index=True,
+    use_container_width=True,
+    on_select="rerun",
+    selection_mode="single-row",
+)
+_selected_rows = _fmt_selection.selection.rows
+FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"] if _selected_rows else "default"
 
 _HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
                  "collapse": "major_ad",   "wide": "ordered_ad"}
@@ -229,7 +250,7 @@ if st.session_state.get("last_load_state") != _load_state:
     st.session_state.pop("haplotypes_raw", None)
 
 if not st.session_state.get("haplotypes_built"):
-    if st.button("Build & download haplotypes", type="primary"):
+    if _selected_rows and st.button("Build & download haplotypes", type="primary"):
         st.session_state["haplotypes_built"] = True
         st.session_state["_auto_download"]   = True
         st.rerun()
