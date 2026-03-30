@@ -60,7 +60,7 @@ def _safe_col_prefix(loci_raw: str) -> str:
 
 # ── Page ─────────────────────────────────────────────────────────────────────
 
-st.title("Inspect Haplotypes", anchor=False)
+st.title("Checkout", anchor=False)
 st.caption("Browse saved haplotype files, select any combination, and download a single merged TSV.")
 
 os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
@@ -121,8 +121,8 @@ else:
 # the cached merge is stale and we show the Merge button again.
 _merge_cache_key = tuple(sorted(selected_files))
 _merge_ready = (
-    st.session_state.get("inspect_merge_key") == _merge_cache_key
-    and "inspect_merged_df" in st.session_state
+    st.session_state.get("checkout_merge_key") == _merge_cache_key
+    and "checkout_merged_df" in st.session_state
 )
 
 if not _merge_ready:
@@ -171,15 +171,15 @@ if not _merge_ready:
             ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             download_name = selected_files[0] if n_sel == 1 else f"merged__{all_loci}__{ts_now}.tsv"
 
-            st.session_state["inspect_merged_df"]   = merged
-            st.session_state["inspect_merged_name"] = download_name
-            st.session_state["inspect_merge_key"]   = _merge_cache_key
+            st.session_state["checkout_merged_df"]   = merged
+            st.session_state["checkout_merged_name"] = download_name
+            st.session_state["checkout_merge_key"]   = _merge_cache_key
             st.rerun()
 
 # ── Preview + download (shown once merge result is cached) ────────────────────
 if _merge_ready:
-    merged        = st.session_state["inspect_merged_df"]
-    download_name = st.session_state["inspect_merged_name"]
+    merged        = st.session_state["checkout_merged_df"]
+    download_name = st.session_state["checkout_merged_name"]
 
     st.caption(
         f"{merged.shape[0]:,} samples × {merged.shape[1]} columns"
