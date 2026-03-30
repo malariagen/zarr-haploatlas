@@ -251,16 +251,16 @@ def render():
         min_samples = c1.number_input(
             "Minimum samples per haplotype",
             min_value=1,
-            max_value=100000,
-            value=1,
+            max_value=100,
+            value=25,
             step=1,
         )
         max_haplotypes = c2.slider(
             "Max haplotypes shown",
-            min_value=10,
-            max_value=150,
-            value=60,
-            step=5,
+            min_value=5,
+            max_value=100,
+            value=15,
+            step=1,
         )
 
         render_checkout_haplotype_summary(
