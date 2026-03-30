@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import time
+import threading
 import datetime
 import pandas as pd
 import streamlit as st
@@ -300,122 +301,217 @@ _settings_hash = hashlib.md5(
 ).hexdigest()[:16]
 
 if st.session_state.get("order_settings_hash") != _settings_hash:
-    for k in [k for k in st.session_state if k.startswith("order_token_")]:
-        del st.session_state[k]
+    existing_job = st.session_state.get("order_job_state")
+    if existing_job is not None:
+        existing_job["cancel"] = True   # signal any running thread to stop
+    st.session_state.pop("order_job_state", None)
     st.session_state["order_settings_hash"] = _settings_hash
-    st.session_state["order_haplotypes_started"] = False
+
+# ── Background build job ──────────────────────────────────────────────────────
+# Runs in a daemon thread so navigation away from this page doesn't stop it.
+# Must not call any st.* function — communicates only via the job_state dict.
+
+def _run_build_job(
+    job_state: dict,
+    tokens: list,
+    reference_files: dict,
+    variant_data,
+    chunk_index_df,
+    excluded_positions: set,
+    het_mode: str,
+    het_sep: str,
+    format_mode: str,
+    apply_filter_pass: bool,
+    apply_numalt1: bool,
+):
+    try:
+        for i, token in enumerate(tokens):
+            if job_state["cancel"]:
+                job_state["status"] = "cancelled"
+                return
+
+            job_state["current_i"] = i
+            job_state["tokens"][i]["state"] = "running"
+            job_state["progress"] = 0.0
+            job_state["progress_text"] = "Parsing locus…"
+
+            parsed_t   = parse_loci_from_input(token)
+            parsed_t   = expand_full_gene_loci(parsed_t, reference_files["cds_gff"])
+            resolved_t = resolve_loci(parsed_t, reference_files["cds_gff"])
+
+            if parsed_t.empty or not resolved_t:
+                job_state["tokens"][i]["state"]    = "skipped"
+                job_state["tokens"][i]["path"]     = None
+                job_state["tokens"][i]["warnings"] = [f"Could not resolve `{token}` — skipping."]
+                continue
+
+            regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
+            job_state["tokens"][i]["warnings"] = warns_t
+
+            if not regions_t:
+                job_state["tokens"][i]["state"] = "skipped"
+                job_state["tokens"][i]["path"]  = None
+                continue
+
+            rids    = list(regions_t.keys())
+            n_r     = len(rids)
+            n_steps = n_r + 2
+
+            for j, sid in enumerate(rids):
+                if job_state["cancel"]:
+                    job_state["status"] = "cancelled"
+                    return
+                job_state["progress"]      = j / n_steps
+                job_state["progress_text"] = f"Loading {sid}…"
+                region   = regions_t[sid]
+                _pos_key = tuple(region["meta"]["positions"].tolist())
+                region["genotypes"], region["g1_wins"] = load_call_data(
+                    region["ds"],
+                    cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
+                    load_ad=(het_mode in ("major_ad", "ordered_ad")),
+                )
+
+            if job_state["cancel"]:
+                job_state["status"] = "cancelled"
+                return
+
+            job_state["progress"]      = n_r / n_steps
+            job_state["progress_text"] = "Building allele matrix…"
+            am = build_allele_matrix(regions_t, excluded_positions, het_mode, het_sep)
+            for r in regions_t.values():
+                r["genotypes"] = r["g1_wins"] = None
+
+            job_state["progress"]      = (n_r + 1) / n_steps
+            job_state["progress_text"] = "Computing haplotypes…"
+            deduped_t = deduplicate_allele_matrix(am)
+            am        = None
+
+            raw_t = compute_haplotypes(
+                deduped_t, regions_t, resolved_t, parsed_t,
+                reference_files["cds_gff"], het_sep=het_sep, mode=format_mode,
+            )
+            deduped_t = None
+
+            raw_t = raw_t.drop(columns=[c for c in raw_t.columns if str(c).isdigit()])
+            for c in [c for c in raw_t.columns if c.endswith("_ns_changes")]:
+                raw_t[c] = raw_t[c].apply(lambda v: _format_ns_changes(v, format_mode))
+
+            os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
+            fname = _token_to_filename(token, format_mode)
+            fpath = os.path.join(HAPLOTYPES_DIR, fname)
+            _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
+
+            job_state["tokens"][i]["state"] = "done"
+            job_state["tokens"][i]["path"]  = fpath
+            job_state["progress"]           = 1.0
+            job_state["progress_text"]      = "Done"
+
+        job_state["status"]    = "done"
+        job_state["current_i"] = None
+        job_state["progress"]  = None
+
+    except Exception as exc:
+        job_state["status"] = "error"
+        job_state["error"]  = str(exc)
+
 
 # ── Build section (fragment: st.rerun() here only re-runs this block, ─────────
 # ── leaving the loci input, variant table, and format selector untouched) ─────
 @st.fragment
 def _build_section():
-    if not st.session_state.get("order_haplotypes_started"):
+    job_state: dict | None = st.session_state.get("order_job_state")
+
+    # ── No active job — show start button ─────────────────────────────────────
+    if job_state is None:
         n_tok = len(_tokens)
         label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
         if _selected_rows:
             if st.button(label, type="primary"):
-                st.session_state["order_haplotypes_started"] = True
+                new_job: dict = {
+                    "cancel":        False,
+                    "n_tokens":      n_tok,
+                    "status":        "running",
+                    "current_i":     None,
+                    "progress":      None,
+                    "progress_text": None,
+                    "error":         None,
+                    "tokens": {
+                        i: {"state": "pending", "path": None, "warnings": [], "error": None}
+                        for i in range(n_tok)
+                    },
+                }
+                st.session_state["order_job_state"] = new_job
+                threading.Thread(
+                    target=_run_build_job,
+                    args=(
+                        new_job, _tokens, reference_files, variant_data,
+                        chunk_index_df, excluded_positions,
+                        HET_MODE, HET_SEP, FORMAT_MODE,
+                        apply_filter_pass, apply_numalt1,
+                    ),
+                    daemon=True,
+                ).start()
                 st.rerun(scope="fragment")
         else:
             st.caption("Select a format strategy above to enable building.")
         return
 
-    # ── Show status for completed tokens ──────────────────────────────────────
-    n_done = sum(1 for i in range(len(_tokens)) if f"order_token_{i}_path" in st.session_state)
-    for i in range(n_done):
-        path = st.session_state.get(f"order_token_{i}_path")
-        token_label = _tokens[i] if i < len(_tokens) else f"token {i+1}"
-        if path:
-            st.success(f"({i+1}/{len(_tokens)}) `{token_label}` → `{path}`")
-        else:
-            st.warning(f"({i+1}/{len(_tokens)}) `{token_label}` → no variants found, skipped.")
+    # ── Job exists — render per-token status ──────────────────────────────────
+    n_tokens = job_state["n_tokens"]
+    status   = job_state["status"]
 
-    # ── Find next pending token ────────────────────────────────────────────────
-    next_i = next(
-        (i for i in range(len(_tokens)) if f"order_token_{i}_path" not in st.session_state),
-        None,
-    )
+    for i in range(n_tokens):
+        tok      = job_state["tokens"].get(i, {})
+        state    = tok.get("state", "pending")
+        label    = f"({i+1}/{n_tokens}) `{_tokens[i]}`"
 
-    if next_i is not None:
-        token = _tokens[next_i]
-        st.info(f"Building ({next_i + 1}/{len(_tokens)}): `{token}`…")
-
-        parsed_t   = parse_loci_from_input(token)
-        parsed_t   = expand_full_gene_loci(parsed_t, reference_files["cds_gff"])
-        resolved_t = resolve_loci(parsed_t, reference_files["cds_gff"])
-
-        if parsed_t.empty or not resolved_t:
-            st.warning(f"Could not resolve `{token}` — skipping.")
-            st.session_state[f"order_token_{next_i}_path"] = None
-            st.rerun(scope="fragment")
-            return
-
-        regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
-        for w in warns_t:
+        for w in tok.get("warnings", []):
             st.warning(w)
 
-        if not regions_t:
-            st.warning(f"No variants found for `{token}` — skipping.")
-            st.session_state[f"order_token_{next_i}_path"] = None
+        if state == "done":
+            if tok["path"]:
+                st.success(f"{label} → `{tok['path']}`")
+            else:
+                st.warning(f"{label} → no variants found, skipped.")
+        elif state == "skipped":
+            st.warning(f"{label} → no variants found, skipped.")
+        elif state == "error":
+            st.error(f"{label} → {tok.get('error')}")
+        elif state == "running":
+            prog = job_state.get("progress")
+            text = job_state.get("progress_text") or f"Building {label}…"
+            if prog is not None:
+                st.progress(prog, text=text)
+            else:
+                st.info(f"Building {label}…")
+        # pending: no output — avoids cluttering the UI before a token starts
+
+    # ── Terminal states ────────────────────────────────────────────────────────
+    if status == "done":
+        if st.button("Build new haplotypes"):
+            st.session_state.pop("order_job_state", None)
+            st.session_state.pop("order_fmt_mode", None)
             st.rerun(scope="fragment")
-            return
+        return
 
-        t0       = time.time()
-        rids     = list(regions_t.keys())
-        n_r      = len(rids)
-        n_steps  = n_r + 2
-        progress = st.progress(0, text="Loading genotypes…")
+    if status in ("cancelled", "error"):
+        if status == "cancelled":
+            st.warning("Build was cancelled.")
+        else:
+            st.error(f"Build error: {job_state.get('error')}")
+        if st.button("Dismiss"):
+            st.session_state.pop("order_job_state", None)
+            st.rerun(scope="fragment")
+        return
 
-        for j, sid in enumerate(rids):
-            region = regions_t[sid]
-            progress.progress(j / n_steps, text=f"Loading {sid}…")
-            # Include positions in the cache key so different tokens querying the
-            # same chromosome (different position ranges) don't share a cache entry.
-            _pos_key = tuple(region["meta"]["positions"].tolist())
-            region["genotypes"], region["g1_wins"] = load_call_data(
-                region["ds"],
-                cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
-                load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
-            )
-
-        progress.progress(n_r / n_steps, text="Building allele matrix…")
-        am = build_allele_matrix(regions_t, excluded_positions, HET_MODE, HET_SEP)
-        for r in regions_t.values():
-            r["genotypes"] = r["g1_wins"] = None
-
-        progress.progress((n_r + 1) / n_steps, text="Computing haplotypes…")
-        deduped_t = deduplicate_allele_matrix(am)
-        am = None
-
-        raw_t = compute_haplotypes(
-            deduped_t, regions_t, resolved_t, parsed_t,
-            reference_files["cds_gff"], het_sep=HET_SEP, mode=FORMAT_MODE,
-        )
-        deduped_t = None
-
-        raw_t = raw_t.drop(columns=[c for c in raw_t.columns if str(c).isdigit()])
-        for c in [c for c in raw_t.columns if c.endswith("_ns_changes")]:
-            raw_t[c] = raw_t[c].apply(lambda v: _format_ns_changes(v, FORMAT_MODE))
-
-        os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
-        fname = _token_to_filename(token, FORMAT_MODE)
-        fpath = os.path.join(HAPLOTYPES_DIR, fname)
-        _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
-
-        elapsed = time.time() - t0
-        progress.progress(1.0, text=f"Done in {elapsed:.1f}s")
-        progress.empty()
-
-        st.session_state[f"order_token_{next_i}_path"] = fpath
+    # ── Still running — cancel button + polling rerun ─────────────────────────
+    if st.button("Cancel build"):
+        job_state["cancel"] = True
         st.rerun(scope="fragment")
+        return
 
-    else:
-        # All done — wipe state so the section resets to the format selector
-        for k in [k for k in st.session_state if k.startswith("order_token_")]:
-            del st.session_state[k]
-        st.session_state.pop("order_fmt_mode", None)
-        st.session_state["order_haplotypes_started"] = False
-        st.rerun(scope="fragment")
+    time.sleep(0.5)
+    st.rerun(scope="fragment")
 
 
 _build_section()
