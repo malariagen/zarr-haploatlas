@@ -46,6 +46,107 @@ def _compact_mutation_label(mutation_key: str, alleles: list[str]) -> str:
     return f"{position}[{'/'.join(map(str, unique_vals))}]"
 
 
+def _extract_position(mutation_key: str) -> str:
+    m = pd.Series([mutation_key]).str.extract(r"_(\d+)")
+    return m.iloc[0, 0] if not m.empty else ""
+
+
+def _extract_residue_tokens(value: str) -> list[str]:
+    if value in ("", "NA"):
+        return []
+    tokens = pd.Series([str(value)]).str.extractall(r"([A-Za-z*?\-]+)")[0].tolist()
+    return [t for t in tokens if t]
+
+
+def _find_matching_ns_changes_column(mutation_col: str, all_columns: list[str]) -> str | None:
+    alias = mutation_col.split("_", 1)[0]
+    suffix = mutation_col.split("__", 1)[1] if "__" in mutation_col else None
+
+    candidates = [
+        c for c in all_columns
+        if c.startswith(f"{alias}_") and "_ns_changes" in c
+    ]
+    if not candidates:
+        return None
+
+    if suffix:
+        suffix_matches = [c for c in candidates if c.endswith(f"__{suffix}")]
+        if suffix_matches:
+            return suffix_matches[0]
+
+    return candidates[0]
+
+
+def _parse_ref_from_ns_changes(ns_text: str, position: str) -> str | None:
+    if not ns_text or ns_text in ("NA", ""):
+        return None
+
+    # Matches entries like S108[S/N] and captures reference residue + position.
+    bracket_hits = pd.Series([ns_text]).str.extractall(r"([A-Za-z*?\-]+)(\d+)\[[^\]]+\]")
+    if not bracket_hits.empty:
+        hits = bracket_hits.reset_index(drop=True)
+        pos_match = hits[hits[1] == position]
+        if not pos_match.empty:
+            return str(pos_match.iloc[0, 0])
+
+    # Fallback for simple notations like N51I.
+    simple_hits = pd.Series([ns_text]).str.extractall(r"([A-Za-z*?\-]+)(\d+)([A-Za-z*?\-]+)")
+    if not simple_hits.empty:
+        hits = simple_hits.reset_index(drop=True)
+        pos_match = hits[hits[1] == position]
+        if not pos_match.empty:
+            return str(pos_match.iloc[0, 0])
+
+    return None
+
+
+def _infer_reference_alleles(merged_df: pd.DataFrame, mutation_columns: list[str]) -> dict[str, str | None]:
+    ref_map: dict[str, str | None] = {}
+    all_columns = merged_df.columns.tolist()
+
+    for mut_col in mutation_columns:
+        position = _extract_position(mut_col)
+        if not position:
+            ref_map[mut_col] = None
+            continue
+
+        ns_col = _find_matching_ns_changes_column(mut_col, all_columns)
+        if ns_col is None:
+            ref_map[mut_col] = None
+            continue
+
+        refs = (
+            merged_df[ns_col]
+            .astype("string")
+            .fillna("NA")
+            .map(lambda x: _parse_ref_from_ns_changes(str(x), position))
+            .dropna()
+        )
+        ref_map[mut_col] = refs.mode().iloc[0] if not refs.empty else None
+
+    return ref_map
+
+
+def _mutation_display_label(mutation_key: str, mode_allele: str, alleles: list[str], ref_allele: str | None) -> str:
+    position_match = pd.Series([mutation_key]).str.extract(r"(\d+)")
+    position = position_match.iloc[0, 0] if not position_match.empty else mutation_key
+
+    ref = str(ref_allele) if ref_allele not in (None, "", "NA") else (str(mode_allele) if pd.notna(mode_allele) else "")
+    if ref in ("", "NA"):
+        return _compact_mutation_label(mutation_key, alleles)
+
+    observed = sorted({tok for a in alleles for tok in _extract_residue_tokens(str(a)) if tok not in ("", "NA")})
+    if not observed:
+        return f"{ref}{position}"
+    if len(observed) == 1:
+        if observed[0] == ref:
+            return f"{ref}{position}"
+        return f"{ref}{position}{observed[0]}"
+
+    ordered = [ref] + [x for x in observed if x != ref] if ref in observed else observed
+    return f"{ref}{position}[{'/'.join(ordered)}]"
+
+
 def _hide_x_axis(plt) -> None:
     plt.xaxis.major_label_text_font_size = "0pt"
     plt.xaxis.major_tick_line_color = None
@@ -143,6 +244,8 @@ def render_checkout_haplotype_summary(
         st.warning("No haplotype combinations pass the current filters.")
         return
 
+    ref_map = _infer_reference_alleles(merged_df, mutation_columns)
+
     hap_order = grouped["haplotype_id"].tolist()
     shared_x = FactorRange(factors=hap_order)
 
@@ -168,17 +271,31 @@ def render_checkout_haplotype_summary(
         sub = mutation_long[mutation_long["alias"] == alias].copy()
         if sub.empty:
             continue
+
+        label_map = {}
+        for mut in sub["mutation"].drop_duplicates().tolist():
+            rows = sub[sub["mutation"] == mut]
+            mode_allele = rows["mode_allele"].iloc[0] if not rows.empty else ""
+            alleles = rows["allele"].astype(str).tolist()
+            label_map[mut] = _mutation_display_label(mut, mode_allele, alleles, ref_map.get(mut))
+
+        # Ensure categorical factors stay unique, even if different mutation keys
+        # would otherwise collapse to the same display label.
+        seen = {}
+        for mut, lbl in list(label_map.items()):
+            k = lbl
+            seen[k] = seen.get(k, 0) + 1
+            if seen[k] > 1:
+                label_map[mut] = f"{lbl} ({seen[k]})"
+
+        sub["mutation_display"] = sub["mutation"].map(label_map)
+
         mutation_order = (
             sub[["mutation", "pos_num", "position", "mut_order"]]
             .drop_duplicates()
             .sort_values(["pos_num", "position", "mut_order"])
         )
-        y_order = mutation_order["mutation"].tolist()[::-1]
-
-        tick_labels = {}
-        for mut in y_order:
-            alleles = sub.loc[sub["mutation"] == mut, "allele"].astype(str).tolist()
-            tick_labels[mut] = _compact_mutation_label(mut, alleles)
+        y_order = [label_map[m] for m in mutation_order["mutation"].tolist()][::-1]
 
         source = ColumnDataSource(sub)
 
@@ -193,7 +310,7 @@ def render_checkout_haplotype_summary(
         mapper = linear_cmap(field_name="is_variant", palette=[Greys256[15], Greys256[220]], low=0, high=1)
         hm.rect(
             x="haplotype_id",
-            y="mutation",
+            y="mutation_display",
             width=0.92,
             height=0.92,
             source=source,
@@ -204,7 +321,8 @@ def render_checkout_haplotype_summary(
             HoverTool(
                 tooltips=[
                     ("Haplotype", "@haplotype_id"),
-                    ("Mutation", "@mutation"),
+                    ("Mutation", "@mutation_display"),
+                    ("Mutation key", "@mutation"),
                     ("Allele", "@allele"),
                     ("Modal allele", "@mode_allele"),
                     ("Samples", "@sample_count"),
@@ -212,7 +330,6 @@ def render_checkout_haplotype_summary(
             )
         )
         hm.yaxis.axis_label = alias
-        hm.yaxis.major_label_overrides = tick_labels
         hm.ygrid.grid_line_color = None
         _hide_x_axis(hm)
 
