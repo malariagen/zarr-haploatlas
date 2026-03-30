@@ -106,12 +106,24 @@ chunk_index_df  = build_chunk_index()
 reference_files = load_reference_files()
 variant_data    = load_variant_data()
 
-DEBUG = st.toggle("Debug mode", key="order_debug", value=False)
+# ── Initialise widget defaults once — never rely on value= to re-set these ───
+# Streamlit can re-apply value= on every render in some versions, which would
+# overwrite the user's in-session changes and corrupt the settings hash.
+_WIDGET_DEFAULTS: dict = {
+    "order_debug":        False,
+    "order_loci_input":   "PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
+    "order_filter_pass":  False,
+    "order_numalt":       False,
+}
+for _k, _v in _WIDGET_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+DEBUG = st.toggle("Debug mode", key="order_debug")
 
 RAW_USER_INPUT = st.text_area(
     "Enter genomic loci",
     key="order_loci_input",
-    value="PF3D7_0709000[72-76,220,271] Pf3D7_04_v3[104205,139150-139156]",
     help=(
         "Amino acid: `PF3D7_XXXXXXX[start-end,pos]` · use `[*]` for the full gene · "
         "Nucleotide: `Pf3D7_??_v3[start-end,pos]` · "
@@ -171,13 +183,11 @@ fcol1, fcol2, _ = st.columns(3)
 apply_filter_pass = fcol1.toggle(
     "Filter pass variants only",
     key="order_filter_pass",
-    value=False,
     help="Exclude variants that do not pass quality filters",
 )
 apply_numalt1 = fcol2.toggle(
     "Biallelic variants only",
     key="order_numalt",
-    value=False,
     help="Exclude multi-allelic variant sites",
 )
 
@@ -270,7 +280,14 @@ _fmt_sel = st.dataframe(
     selection_mode="single-row",
 )
 _selected_rows = _fmt_sel.selection.rows
-FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"] if _selected_rows else "default"
+if _selected_rows:
+    # User made (or restored) a selection — update the persisted value.
+    FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"]
+    st.session_state["order_fmt_mode"] = FORMAT_MODE
+else:
+    # No selection visible (e.g. first render or selection lost on navigation) —
+    # fall back to whatever was last explicitly chosen, defaulting to "default".
+    FORMAT_MODE = st.session_state.get("order_fmt_mode", "default")
 
 _HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
                  "collapse": "major_ad",   "wide": "ordered_ad"}
@@ -290,7 +307,10 @@ if st.session_state.get("order_settings_hash") != _settings_hash:
 
 # ── Build button ──────────────────────────────────────────────────────────────
 if not st.session_state.get("order_haplotypes_started"):
-    if _selected_rows:
+    # Allow building if there's a live selection OR a previously persisted mode
+    # (the selection can be lost on navigation but FORMAT_MODE is still valid).
+    _fmt_chosen = bool(_selected_rows) or "order_fmt_mode" in st.session_state
+    if _fmt_chosen:
         n_tok = len(_tokens)
         label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
         if st.button(label, type="primary"):
