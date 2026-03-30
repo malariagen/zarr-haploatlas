@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import re
 from bokeh.embed import file_html
 from bokeh.layouts import column
 from bokeh.models import ColumnDataSource, FactorRange, HoverTool
@@ -9,6 +10,12 @@ from bokeh.palettes import Greys256
 from bokeh.plotting import figure
 from bokeh.resources import CDN
 from bokeh.transform import linear_cmap
+
+
+_POS_RE = re.compile(r"_(\d+)")
+_RESIDUE_TOKEN_RE = re.compile(r"([A-Za-z*?\-]+)")
+_BRACKET_REF_RE = re.compile(r"([A-Za-z*?\-]+)(\d+)\[[^\]]+\]")
+_SIMPLE_REF_RE = re.compile(r"([A-Za-z*?\-]+)(\d+)([A-Za-z*?\-]+)")
 
 
 def _normalise_for_grouping(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -47,15 +54,14 @@ def _compact_mutation_label(mutation_key: str, alleles: list[str]) -> str:
 
 
 def _extract_position(mutation_key: str) -> str:
-    m = pd.Series([mutation_key]).str.extract(r"_(\d+)")
-    return m.iloc[0, 0] if not m.empty else ""
+    m = _POS_RE.search(mutation_key)
+    return m.group(1) if m else ""
 
 
 def _extract_residue_tokens(value: str) -> list[str]:
     if value in ("", "NA"):
         return []
-    tokens = pd.Series([str(value)]).str.extractall(r"([A-Za-z*?\-]+)")[0].tolist()
-    return [t for t in tokens if t]
+    return [t for t in _RESIDUE_TOKEN_RE.findall(str(value)) if t]
 
 
 def _find_matching_ns_changes_column(mutation_col: str, all_columns: list[str]) -> str | None:
@@ -81,21 +87,14 @@ def _parse_ref_from_ns_changes(ns_text: str, position: str) -> str | None:
     if not ns_text or ns_text in ("NA", ""):
         return None
 
-    # Matches entries like S108[S/N] and captures reference residue + position.
-    bracket_hits = pd.Series([ns_text]).str.extractall(r"([A-Za-z*?\-]+)(\d+)\[[^\]]+\]")
-    if not bracket_hits.empty:
-        hits = bracket_hits.reset_index(drop=True)
-        pos_match = hits[hits[1] == position]
-        if not pos_match.empty:
-            return str(pos_match.iloc[0, 0])
+    for ref, pos in _BRACKET_REF_RE.findall(ns_text):
+        if pos == position:
+            return ref
 
     # Fallback for simple notations like N51I.
-    simple_hits = pd.Series([ns_text]).str.extractall(r"([A-Za-z*?\-]+)(\d+)([A-Za-z*?\-]+)")
-    if not simple_hits.empty:
-        hits = simple_hits.reset_index(drop=True)
-        pos_match = hits[hits[1] == position]
-        if not pos_match.empty:
-            return str(pos_match.iloc[0, 0])
+    for ref, pos, _alt in _SIMPLE_REF_RE.findall(ns_text):
+        if pos == position:
+            return ref
 
     return None
 
@@ -128,8 +127,7 @@ def _infer_reference_alleles(merged_df: pd.DataFrame, mutation_columns: list[str
 
 
 def _mutation_display_label(mutation_key: str, mode_allele: str, alleles: list[str], ref_allele: str | None) -> str:
-    position_match = pd.Series([mutation_key]).str.extract(r"(\d+)")
-    position = position_match.iloc[0, 0] if not position_match.empty else mutation_key
+    position = _extract_position(mutation_key) or mutation_key
 
     ref = str(ref_allele) if ref_allele not in (None, "", "NA") else (str(mode_allele) if pd.notna(mode_allele) else "")
     if ref in ("", "NA"):
@@ -272,11 +270,20 @@ def render_checkout_haplotype_summary(
         if sub.empty:
             continue
 
+        meta = (
+            sub.groupby("mutation", sort=False)
+            .agg(
+                mode_allele=("mode_allele", "first"),
+                alleles=("allele", lambda s: [str(v) for v in s.tolist()]),
+            )
+            .reset_index()
+        )
+
         label_map = {}
-        for mut in sub["mutation"].drop_duplicates().tolist():
-            rows = sub[sub["mutation"] == mut]
-            mode_allele = rows["mode_allele"].iloc[0] if not rows.empty else ""
-            alleles = rows["allele"].astype(str).tolist()
+        for _, row in meta.iterrows():
+            mut = row["mutation"]
+            mode_allele = row["mode_allele"]
+            alleles = row["alleles"]
             label_map[mut] = _mutation_display_label(mut, mode_allele, alleles, ref_map.get(mut))
 
         # Ensure categorical factors stay unique, even if different mutation keys
