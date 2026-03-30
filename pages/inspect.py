@@ -116,77 +116,81 @@ else:
     gene_labels = [files_df.iloc[i]["gene"] for i in selected_indices]
     st.subheader(f"Selected {n_sel} files: {', '.join(gene_labels)}")
 
-if st.button("Merge & Download", type="primary"):
-    # ── Load files ────────────────────────────────────────────────────────────
-    dfs = []
-    load_errors = []
-    for fname in selected_files:
-        path = os.path.join(HAPLOTYPES_DIR, fname)
-        try:
-            dfs.append(pd.read_csv(path, sep="\t", low_memory=False))
-        except Exception as e:
-            load_errors.append(f"`{fname}`: {e}")
+# ── Merge ─────────────────────────────────────────────────────────────────────
+# Cache key: the sorted set of selected filenames. If the selection changes,
+# the cached merge is stale and we show the Merge button again.
+_merge_cache_key = tuple(sorted(selected_files))
+_merge_ready = (
+    st.session_state.get("inspect_merge_key") == _merge_cache_key
+    and "inspect_merged_df" in st.session_state
+)
 
-    for err in load_errors:
-        st.error(err)
-    if not dfs:
-        st.stop()
+if not _merge_ready:
+    if st.button("Merge", type="primary"):
+        dfs = []
+        load_errors = []
+        for fname in selected_files:
+            path = os.path.join(HAPLOTYPES_DIR, fname)
+            try:
+                dfs.append(pd.read_csv(path, sep="\t", low_memory=False))
+            except Exception as e:
+                load_errors.append(f"`{fname}`: {e}")
 
-    # ── Check for column conflicts across files ───────────────────────────────
-    # A conflict exists when the same non-sample_id column appears in 2+ files.
-    all_non_sid = [set(df.columns) - {"sample_id"} for df in dfs]
-    all_non_sid_union = set().union(*all_non_sid)
-    conflict_cols = {
-        c for c in all_non_sid_union
-        if sum(c in cols for cols in all_non_sid) > 1
-    }
+        for err in load_errors:
+            st.error(err)
 
-    if conflict_cols:
-        # Prefix conflicting columns with the raw loci label (e.g. "crt_72.74")
-        # to disambiguate, e.g. two CRT files with different position ranges.
-        labeled_dfs = []
-        for df, row_idx in zip(dfs, selected_indices):
-            prefix = _safe_col_prefix(files_df.iloc[row_idx]["_loci_raw"])
-            rename = {
-                c: f"{c}__{prefix}"
-                for c in df.columns
-                if c != "sample_id" and c in conflict_cols
+        if dfs:
+            # Detect column conflicts (same non-sample_id column in 2+ files)
+            all_non_sid = [set(df.columns) - {"sample_id"} for df in dfs]
+            conflict_cols = {
+                c for c in set().union(*all_non_sid)
+                if sum(c in cols for cols in all_non_sid) > 1
             }
-            labeled_dfs.append(df.rename(columns=rename))
-        dfs = labeled_dfs
+            if conflict_cols:
+                labeled_dfs = []
+                for df, row_idx in zip(dfs, selected_indices):
+                    prefix = _safe_col_prefix(files_df.iloc[row_idx]["_loci_raw"])
+                    rename = {
+                        c: f"{c}__{prefix}"
+                        for c in df.columns
+                        if c != "sample_id" and c in conflict_cols
+                    }
+                    labeled_dfs.append(df.rename(columns=rename))
+                dfs = labeled_dfs
 
-    # ── Merge all on sample_id (outer join) ───────────────────────────────────
-    merged = dfs[0]
-    for df in dfs[1:]:
-        merged = merged.merge(df, on="sample_id", how="outer")
+            merged = dfs[0]
+            for df in dfs[1:]:
+                merged = merged.merge(df, on="sample_id", how="outer")
 
-    # Put sample_id first, sort rows alphabetically
-    cols = ["sample_id"] + [c for c in merged.columns if c != "sample_id"]
-    merged = merged[cols].sort_values("sample_id").reset_index(drop=True)
+            cols = ["sample_id"] + [c for c in merged.columns if c != "sample_id"]
+            merged = merged[cols].sort_values("sample_id").reset_index(drop=True)
 
-    # ── Build download filename ───────────────────────────────────────────────
-    all_loci = "+".join(
-        _safe_col_prefix(files_df.iloc[i]["_loci_raw"]) for i in selected_indices
+            all_loci = "+".join(
+                _safe_col_prefix(files_df.iloc[i]["_loci_raw"]) for i in selected_indices
+            )
+            ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            download_name = selected_files[0] if n_sel == 1 else f"merged__{all_loci}__{ts_now}.tsv"
+
+            st.session_state["inspect_merged_df"]   = merged
+            st.session_state["inspect_merged_name"] = download_name
+            st.session_state["inspect_merge_key"]   = _merge_cache_key
+            st.rerun()
+
+# ── Preview + download (shown once merge result is cached) ────────────────────
+if _merge_ready:
+    merged        = st.session_state["inspect_merged_df"]
+    download_name = st.session_state["inspect_merged_name"]
+
+    st.caption(
+        f"{merged.shape[0]:,} samples × {merged.shape[1]} columns"
+        + (f" merged from {n_sel} files" if n_sel > 1 else "")
     )
-    ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    if n_sel == 1:
-        download_name = selected_files[0]
-    else:
-        download_name = f"merged__{all_loci}__{ts_now}.tsv"
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    st.success(
-        f"Merged {n_sel} file(s): "
-        f"{merged.shape[0]:,} samples × {merged.shape[1]} columns."
-    )
+    st.dataframe(merged, hide_index=True, use_container_width=True)
 
     tsv_out = merged.to_csv(sep="\t", index=False)
     st.download_button(
-        "Download merged TSV",
+        "Download TSV",
         tsv_out,
         file_name=download_name,
         mime="text/tab-separated-values",
     )
-
-    with st.expander("Preview (first 20 rows)"):
-        st.dataframe(merged.head(20), hide_index=True, use_container_width=True)

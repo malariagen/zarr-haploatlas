@@ -305,34 +305,35 @@ if st.session_state.get("order_settings_hash") != _settings_hash:
     st.session_state["order_settings_hash"] = _settings_hash
     st.session_state["order_haplotypes_started"] = False
 
-# ── Build button ──────────────────────────────────────────────────────────────
-if not st.session_state.get("order_haplotypes_started"):
-    # Allow building if there's a live selection OR a previously persisted mode
-    # (the selection can be lost on navigation but FORMAT_MODE is still valid).
-    _fmt_chosen = bool(_selected_rows) or "order_fmt_mode" in st.session_state
-    if _fmt_chosen:
-        n_tok = len(_tokens)
-        label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
-        if st.button(label, type="primary"):
-            st.session_state["order_haplotypes_started"] = True
-            st.rerun()
-    else:
-        st.caption("Select a format strategy above to enable building.")
+# ── Build section (fragment: st.rerun() here only re-runs this block, ─────────
+# ── leaving the loci input, variant table, and format selector untouched) ─────
+@st.fragment
+def _build_section():
+    if not st.session_state.get("order_haplotypes_started"):
+        # Allow building if there's a live selection OR a previously persisted mode
+        # (the selection can be lost on navigation but FORMAT_MODE is still valid).
+        _fmt_chosen = bool(_selected_rows) or "order_fmt_mode" in st.session_state
+        if _fmt_chosen:
+            n_tok = len(_tokens)
+            label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
+            if st.button(label, type="primary"):
+                st.session_state["order_haplotypes_started"] = True
+                st.rerun()
+        else:
+            st.caption("Select a format strategy above to enable building.")
+        return
 
-# ── Per-token build loop ──────────────────────────────────────────────────────
-else:
-    # Show status for all tokens already completed this session
+    # ── Show status for completed tokens ──────────────────────────────────────
     n_done = sum(1 for i in range(len(_tokens)) if f"order_token_{i}_path" in st.session_state)
-
     for i in range(n_done):
         path = st.session_state.get(f"order_token_{i}_path")
         token_label = _tokens[i] if i < len(_tokens) else f"token {i+1}"
         if path:
-            st.success(f"({i+1}/{len(_tokens)}) `{token_label}` → saved to `{path}`")
+            st.success(f"({i+1}/{len(_tokens)}) `{token_label}` → `{path}`")
         else:
             st.warning(f"({i+1}/{len(_tokens)}) `{token_label}` → no variants found, skipped.")
 
-    # Find next pending token
+    # ── Find next pending token ────────────────────────────────────────────────
     next_i = next(
         (i for i in range(len(_tokens)) if f"order_token_{i}_path" not in st.session_state),
         None,
@@ -342,96 +343,86 @@ else:
         token = _tokens[next_i]
         st.info(f"Building ({next_i + 1}/{len(_tokens)}): `{token}`…")
 
-        # ── Parse this token independently ────────────────────────────────────
-        parsed_t  = parse_loci_from_input(token)
-        parsed_t  = expand_full_gene_loci(parsed_t, reference_files["cds_gff"])
+        parsed_t   = parse_loci_from_input(token)
+        parsed_t   = expand_full_gene_loci(parsed_t, reference_files["cds_gff"])
         resolved_t = resolve_loci(parsed_t, reference_files["cds_gff"])
 
         if parsed_t.empty or not resolved_t:
             st.warning(f"Could not resolve `{token}` — skipping.")
             st.session_state[f"order_token_{next_i}_path"] = None
             st.rerun()
-        else:
-            regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
-            for w in warns_t:
-                st.warning(w)
+            return
 
-            if not regions_t:
-                st.warning(f"No variants found for `{token}` — skipping.")
-                st.session_state[f"order_token_{next_i}_path"] = None
-                st.rerun()
-            else:
-                t0       = time.time()
-                rids     = list(regions_t.keys())
-                n_r      = len(rids)
-                n_steps  = n_r + 2
-                progress = st.progress(0, text="Loading genotypes…")
+        regions_t, warns_t = build_regions(resolved_t, variant_data, chunk_index_df)
+        for w in warns_t:
+            st.warning(w)
 
-                for j, sid in enumerate(rids):
-                    region = regions_t[sid]
-                    progress.progress(j / n_steps, text=f"Loading {sid}…")
-                    # Include positions in the cache key: different tokens can query
-                    # the same chromosome at different position ranges, producing
-                    # different ds objects. Without positions, load_call_data would
-                    # return a stale cache hit from an earlier token and cause an
-                    # IndexError when the variant counts differ.
-                    _pos_key = tuple(region["meta"]["positions"].tolist())
-                    region["genotypes"], region["g1_wins"] = load_call_data(
-                        region["ds"],
-                        cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
-                        load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
-                    )
+        if not regions_t:
+            st.warning(f"No variants found for `{token}` — skipping.")
+            st.session_state[f"order_token_{next_i}_path"] = None
+            st.rerun()
+            return
 
-                progress.progress(n_r / n_steps, text="Building allele matrix…")
-                am = build_allele_matrix(regions_t, excluded_positions, HET_MODE, HET_SEP)
-                for r in regions_t.values():
-                    r["genotypes"] = r["g1_wins"] = None
+        t0       = time.time()
+        rids     = list(regions_t.keys())
+        n_r      = len(rids)
+        n_steps  = n_r + 2
+        progress = st.progress(0, text="Loading genotypes…")
 
-                progress.progress((n_r + 1) / n_steps, text="Computing haplotypes…")
-                deduped_t = deduplicate_allele_matrix(am)
-                am = None
+        for j, sid in enumerate(rids):
+            region = regions_t[sid]
+            progress.progress(j / n_steps, text=f"Loading {sid}…")
+            # Include positions in the cache key so different tokens querying the
+            # same chromosome (different position ranges) don't share a cache entry.
+            _pos_key = tuple(region["meta"]["positions"].tolist())
+            region["genotypes"], region["g1_wins"] = load_call_data(
+                region["ds"],
+                cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
+                load_ad=(HET_MODE in ("major_ad", "ordered_ad")),
+            )
 
-                raw_t = compute_haplotypes(
-                    deduped_t, regions_t, resolved_t, parsed_t,
-                    reference_files["cds_gff"], het_sep=HET_SEP, mode=FORMAT_MODE,
-                )
-                deduped_t = None
+        progress.progress(n_r / n_steps, text="Building allele matrix…")
+        am = build_allele_matrix(regions_t, excluded_positions, HET_MODE, HET_SEP)
+        for r in regions_t.values():
+            r["genotypes"] = r["g1_wins"] = None
 
-                # Drop raw position columns
-                raw_t = raw_t.drop(columns=[c for c in raw_t.columns if str(c).isdigit()])
+        progress.progress((n_r + 1) / n_steps, text="Computing haplotypes…")
+        deduped_t = deduplicate_allele_matrix(am)
+        am = None
 
-                # Format ns_changes
-                for c in [c for c in raw_t.columns if c.endswith("_ns_changes")]:
-                    raw_t[c] = raw_t[c].apply(lambda v: _format_ns_changes(v, FORMAT_MODE))
+        raw_t = compute_haplotypes(
+            deduped_t, regions_t, resolved_t, parsed_t,
+            reference_files["cds_gff"], het_sep=HET_SEP, mode=FORMAT_MODE,
+        )
+        deduped_t = None
 
-                # Save
-                os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
-                fname = _token_to_filename(token, FORMAT_MODE)
-                fpath = os.path.join(HAPLOTYPES_DIR, fname)
-                _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
+        raw_t = raw_t.drop(columns=[c for c in raw_t.columns if str(c).isdigit()])
+        for c in [c for c in raw_t.columns if c.endswith("_ns_changes")]:
+            raw_t[c] = raw_t[c].apply(lambda v: _format_ns_changes(v, FORMAT_MODE))
 
-                elapsed = time.time() - t0
-                progress.progress(1.0, text=f"Done in {elapsed:.1f}s")
-                progress.empty()
+        os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
+        fname = _token_to_filename(token, FORMAT_MODE)
+        fpath = os.path.join(HAPLOTYPES_DIR, fname)
+        _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
 
-                st.session_state[f"order_token_{next_i}_path"] = fpath
-                st.rerun()
+        elapsed = time.time() - t0
+        progress.progress(1.0, text=f"Done in {elapsed:.1f}s")
+        progress.empty()
+
+        st.session_state[f"order_token_{next_i}_path"] = fpath
+        st.rerun()  # fragment-only rerun — variant table and loci input stay still
 
     else:
-        # All tokens finished
         st.caption(
             f"All {len(_tokens)} file{'s' if len(_tokens) != 1 else ''} saved. "
             "Switch to **Inspect** to browse and combine them."
         )
-
         if DEBUG:
             with st.expander("Debug"):
-                st.toggle(
-                    "Save intermediate outputs",
-                    key="order_debug_intermediates",
-                    help="Flip on, then rebuild to capture intermediate matrices.",
-                )
                 for i in range(len(_tokens)):
                     path = st.session_state.get(f"order_token_{i}_path")
                     if path:
                         st.write(f"Token {i}: `{path}`")
+
+
+_build_section()
