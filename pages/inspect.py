@@ -14,6 +14,9 @@ _FNAME_RE = re.compile(
     r'^(?P<loci>.+?)__(?P<coord_type>aa|nt|mixed)__(?P<fmt>default|skip|collapse|wide)__'
     r'(?P<ts>\d{8}_\d{6})\.tsv$'
 )
+# loci field has the form {gene_label}_{pos_summary}, e.g. crt_72.74 or 0709000_76-93.
+# We split on the *last* underscore to separate gene label from position summary.
+_LOCI_SPLIT_RE = re.compile(r'^(.+)_([^_]+)$')
 
 
 def _parse_filename(fname: str) -> dict:
@@ -24,26 +27,35 @@ def _parse_filename(fname: str) -> dict:
             created = dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             created = m.group("ts")
+        loci_raw = m.group("loci")   # e.g. "crt_72.74" or "0709000_76-93"
+        loci_m = _LOCI_SPLIT_RE.match(loci_raw)
+        gene     = loci_m.group(1) if loci_m else loci_raw
+        pos      = loci_m.group(2).replace(".", ", ") if loci_m else ""
         return {
-            "filename":   fname,
-            "loci":       m.group("loci").replace("+", " + "),
-            "type":       m.group("coord_type"),
-            "format":     m.group("fmt"),
-            "created":    created,
+            "filename": fname,
+            "gene":     gene,
+            "positions": pos,
+            "type":     m.group("coord_type"),
+            "format":   m.group("fmt"),
+            "created":  created,
+            # keep raw loci for merge logic
+            "_loci_raw": loci_raw,
         }
-    # Fallback for files that don't match (e.g. manually placed reference files)
+    # Fallback for manually placed files that don't match the naming convention
     return {
-        "filename": fname,
-        "loci":     fname.removesuffix(".tsv"),
-        "type":     "?",
-        "format":   "?",
-        "created":  "?",
+        "filename":  fname,
+        "gene":      fname.removesuffix(".tsv"),
+        "positions": "",
+        "type":      "?",
+        "format":    "?",
+        "created":   "?",
+        "_loci_raw": fname.removesuffix(".tsv"),
     }
 
 
-def _safe_col_prefix(loci_str: str) -> str:
-    """Turn a loci label like 'crt + dhps' into a safe column prefix 'crt+dhps'."""
-    return re.sub(r'[^A-Za-z0-9+]', '_', loci_str.replace(" + ", "+"))
+def _safe_col_prefix(loci_raw: str) -> str:
+    """Turn a raw loci string like 'crt_72.74' into a safe column prefix."""
+    return re.sub(r'[^A-Za-z0-9]', '_', loci_raw)
 
 
 # ── Page ─────────────────────────────────────────────────────────────────────
@@ -77,11 +89,13 @@ selection = st.dataframe(
     on_select="rerun",
     selection_mode="multi-row",
     column_config={
-        "filename": st.column_config.TextColumn("Filename"),
-        "loci":     st.column_config.TextColumn("Loci",    width="medium"),
-        "type":     st.column_config.TextColumn("Type",    width="small"),
-        "format":   st.column_config.TextColumn("Format",  width="small"),
-        "created":  st.column_config.TextColumn("Created", width="medium"),
+        "filename":  st.column_config.TextColumn("Filename"),
+        "gene":      st.column_config.TextColumn("Gene / alias", width="medium"),
+        "positions": st.column_config.TextColumn("Positions",    width="medium"),
+        "type":      st.column_config.TextColumn("Type",         width="small"),
+        "format":    st.column_config.TextColumn("Format",       width="small"),
+        "created":   st.column_config.TextColumn("Created",      width="medium"),
+        "_loci_raw": None,  # hide internal field
     },
 )
 
@@ -99,8 +113,8 @@ n_sel = len(selected_files)
 if n_sel == 1:
     st.subheader(f"Selected: `{selected_files[0]}`")
 else:
-    loci_labels = [files_df.iloc[i]["loci"] for i in selected_indices]
-    st.subheader(f"Selected {n_sel} files: {', '.join(loci_labels)}")
+    gene_labels = [files_df.iloc[i]["gene"] for i in selected_indices]
+    st.subheader(f"Selected {n_sel} files: {', '.join(gene_labels)}")
 
 if st.button("Merge & Download", type="primary"):
     # ── Load files ────────────────────────────────────────────────────────────
@@ -128,11 +142,11 @@ if st.button("Merge & Download", type="primary"):
     }
 
     if conflict_cols:
-        # Prefix each file's non-sample_id columns with its loci label to
-        # disambiguate (e.g. two CRT files with different format modes).
+        # Prefix conflicting columns with the raw loci label (e.g. "crt_72.74")
+        # to disambiguate, e.g. two CRT files with different position ranges.
         labeled_dfs = []
         for df, row_idx in zip(dfs, selected_indices):
-            prefix = _safe_col_prefix(files_df.iloc[row_idx]["loci"])
+            prefix = _safe_col_prefix(files_df.iloc[row_idx]["_loci_raw"])
             rename = {
                 c: f"{c}__{prefix}"
                 for c in df.columns
@@ -152,7 +166,7 @@ if st.button("Merge & Download", type="primary"):
 
     # ── Build download filename ───────────────────────────────────────────────
     all_loci = "+".join(
-        _safe_col_prefix(files_df.iloc[i]["loci"]) for i in selected_indices
+        _safe_col_prefix(files_df.iloc[i]["_loci_raw"]) for i in selected_indices
     )
     ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     if n_sel == 1:
