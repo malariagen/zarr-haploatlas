@@ -1,28 +1,14 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+from bokeh.embed import file_html
 from bokeh.layouts import column
 from bokeh.models import ColumnDataSource, HoverTool
-from bokeh.palettes import Category20, Greys256
+from bokeh.palettes import Greys256
 from bokeh.plotting import figure
+from bokeh.resources import CDN
 from bokeh.transform import linear_cmap
-
-
-POPULATION_COLOURS = {
-    "LA-W": "#b8e186",
-    "LA-E": "#4dac26",
-    "AF-W": "#e31a1c",
-    "AF-C": "#fd8d3c",
-    "AF-NE": "#bb8129",
-    "AF-E": "#fecc5c",
-    "AS-S-E": "#dfc0eb",
-    "AS-S-FE": "#984ea3",
-    "AS-SE-W": "#9ecae1",
-    "AS-SE-E": "#3182bd",
-    "AS-SE-M": "#02818a",
-    "OC-NG": "#f781bf",
-    "EU": "#003399",
-}
 
 
 def _normalise_for_grouping(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -37,13 +23,10 @@ def _normalise_for_grouping(df: pd.DataFrame, columns: list[str]) -> pd.DataFram
 def _prepare_haplotype_summary_data(
     merged_df: pd.DataFrame,
     mutation_columns: list[str],
-    geography_column: str | None,
     min_samples: int,
     max_haplotypes: int,
 ) -> dict:
     work_cols = ["sample_id"] + mutation_columns
-    if geography_column:
-        work_cols.append(geography_column)
 
     work = merged_df[work_cols].copy()
     norm_mut = _normalise_for_grouping(work, mutation_columns)
@@ -99,30 +82,15 @@ def _prepare_haplotype_summary_data(
     mutation_long = mutation_long.merge(order_df, on="mutation", how="left")
     mutation_long = mutation_long.sort_values(["alias", "pos_num", "position", "mut_order"])
 
-    geo_long = pd.DataFrame()
-    if geography_column:
-        geo_long = (
-            grouped_sample_rows
-            .groupby(["haplotype_id", geography_column], dropna=False)
-            .size()
-            .reset_index(name="count")
-            .rename(columns={geography_column: "geography"})
-        )
-        totals = geo_long.groupby("haplotype_id")["count"].transform("sum")
-        geo_long["percentage"] = (100 * geo_long["count"] / totals).round(2)
-        geo_long["geography"] = geo_long["geography"].astype("string").fillna("NA")
-
     return {
         "grouped": grouped,
         "mutation_long": mutation_long,
-        "geo_long": geo_long,
     }
 
 
 def render_checkout_haplotype_summary(
     merged_df: pd.DataFrame,
     mutation_columns: list[str],
-    geography_column: str | None = None,
     min_samples: int = 1,
     max_haplotypes: int = 60,
 ) -> None:
@@ -133,7 +101,6 @@ def render_checkout_haplotype_summary(
     prep = _prepare_haplotype_summary_data(
         merged_df=merged_df,
         mutation_columns=mutation_columns,
-        geography_column=geography_column,
         min_samples=min_samples,
         max_haplotypes=max_haplotypes,
     )
@@ -160,42 +127,6 @@ def render_checkout_haplotype_summary(
     count_fig.yaxis.axis_label = "Number of samples"
 
     figures = [count_fig]
-
-    geo_long = prep["geo_long"]
-    if not geo_long.empty:
-        geo_categories = sorted(geo_long["geography"].dropna().unique().tolist())
-        fallback = (Category20[20] * ((len(geo_categories) // 20) + 1))[: len(geo_categories)]
-        palette = [POPULATION_COLOURS.get(cat, fallback[i]) for i, cat in enumerate(geo_categories)]
-        geo_wide = (
-            geo_long
-            .pivot(index="haplotype_id", columns="geography", values="percentage")
-            .fillna(0)
-            .reindex(hap_order)
-            .reset_index()
-        )
-        geo_fig = figure(
-            title="Population / geography distribution (%)",
-            x_range=hap_order,
-            height=280,
-            sizing_mode="stretch_width",
-            tools="pan,wheel_zoom,reset,save",
-            toolbar_location="right",
-        )
-        geo_fig.vbar_stack(
-            geo_categories,
-            x="haplotype_id",
-            width=0.85,
-            source=ColumnDataSource(geo_wide),
-            color=palette,
-            legend_label=geo_categories,
-        )
-        geo_fig.yaxis.axis_label = "Percentage"
-        geo_fig.y_range.start = 0
-        geo_fig.y_range.end = 100
-        geo_fig.xaxis.major_label_orientation = 1.0
-        geo_fig.legend.location = "top_left"
-        geo_fig.legend.click_policy = "hide"
-        figures.append(geo_fig)
 
     mutation_long = prep["mutation_long"]
     aliases = mutation_long["alias"].dropna().unique().tolist()
@@ -260,4 +191,6 @@ def render_checkout_haplotype_summary(
 
         figures.append(hm)
 
-    st.bokeh_chart(column(*figures, sizing_mode="stretch_width"), use_container_width=True)
+    cn_layout = column(*figures, sizing_mode="stretch_width")
+    total_height = int(sum((fig.height or 260) for fig in figures) + 40)
+    components.html(file_html(cn_layout, CDN), height=total_height, scrolling=True)

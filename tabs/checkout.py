@@ -72,21 +72,6 @@ def _is_mutation_column(col_name: str) -> bool:
     return False
 
 
-def _candidate_geography_columns(df: pd.DataFrame) -> list[str]:
-    cols = []
-    for c in df.columns:
-        if c == "sample_id":
-            continue
-        if not pd.api.types.is_object_dtype(df[c]) and not pd.api.types.is_string_dtype(df[c]):
-            continue
-        if df[c].nunique(dropna=True) > 100:
-            continue
-        c_lower = c.lower()
-        if any(k in c_lower for k in ["pop", "country", "site", "region", "geo"]):
-            cols.append(c)
-    return cols
-
-
 # ── Page ─────────────────────────────────────────────────────────────────────
 
 def render():
@@ -240,22 +225,27 @@ def render():
             st.info("Need at least two mutation-like columns in the merged data to plot a haplotype summary.")
             return
 
-        default_cols = mutation_candidates[: min(3, len(mutation_candidates))]
-        selected_mutation_cols = st.multiselect(
-            "Mutation columns",
-            options=mutation_candidates,
-            default=default_cols,
-            help="Each selected column is treated as one mutation row in the heatmap.",
+        st.caption("Select columns directly in the table below (multi-column selection enabled).")
+        selector_df = merged[mutation_candidates]
+        col_selection = st.dataframe(
+            selector_df,
+            hide_index=True,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="multi-column",
+            key="checkout_mutation_column_selector",
         )
-
-        geo_candidates = _candidate_geography_columns(merged)
-        geography_choice = st.selectbox(
-            "Population/geography column (optional)",
-            options=["None", *geo_candidates],
-            index=0,
-            help="If selected, a stacked distribution panel is shown for each haplotype.",
-        )
-        geography_col = None if geography_choice == "None" else geography_choice
+        raw_selected_cols = list(col_selection.selection.columns)
+        if raw_selected_cols and isinstance(raw_selected_cols[0], int):
+            selected_mutation_cols = [selector_df.columns[i] for i in raw_selected_cols if i < len(selector_df.columns)]
+        else:
+            selected_mutation_cols = raw_selected_cols
+        if not selected_mutation_cols:
+            st.info("Select two or more mutation columns in the table above to render the haplotype summary.")
+            return
+        if len(selected_mutation_cols) < 2:
+            st.info("Select at least two mutation columns in the table above.")
+            return
 
         c1, c2 = st.columns(2)
         min_samples = c1.number_input(
@@ -276,7 +266,6 @@ def render():
         render_checkout_haplotype_summary(
             merged_df=merged,
             mutation_columns=selected_mutation_cols,
-            geography_column=geography_col,
             min_samples=int(min_samples),
             max_haplotypes=int(max_haplotypes),
         )
