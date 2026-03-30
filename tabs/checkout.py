@@ -64,6 +64,9 @@ def render():
     st.title("Checkout", anchor=False)
     st.caption("Browse saved haplotype files, select any combination, and download a single merged TSV.")
 
+    if st.button("Refresh file list"):
+        st.rerun()
+
     os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
 
     tsv_files = sorted(
