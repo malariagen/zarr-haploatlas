@@ -219,7 +219,7 @@ st.dataframe(
     display_meta.style.apply(_highlight_failed, axis=1).map(_color_bool, subset=_BOOL_COLS),
     hide_index=True,
     width="stretch",
-    column_config={"alt": st.column_config.ListColumn("alt alleles"), "numalt": None},
+    column_config={"alt": st.column_config.ListColumn("alt alleles"), "numalt": None, "ref_len": None},
 )
 st.caption(
     f"{total_vars} variant sites across {len(regions)} {'locus' if len(regions) == 1 else 'loci'}, "
@@ -244,11 +244,11 @@ _FORMAT_DF = pd.DataFrame([
         "format of '_ns_changes' column": "G42-, K43T, M56[T/M], C58K",
     }, {
         "format strategy": "skip",
-        "description": "Skip processing hets and mark as *",
+        "description": "Skip processing hets and mark as #",
         "speed": "faster",
-        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "*",
-        "format of '_haplotype' column": "-T,*GK",
-        "format of '_ns_changes' column": "G42-, K43T, M56*, C58K",
+        "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "#",
+        "format of '_haplotype' column": "-T,#GK",
+        "format of '_ns_changes' column": "G42-, K43T, M56#, C58K",
     }, {
         "format strategy": "collapse",
         "description": "Resolve het to hom using the major allele",
@@ -313,12 +313,6 @@ def _build_section():
         n_tok = len(_tokens)
         label = f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})"
         if _selected_rows:
-            if st.button(label, type="primary"):
-                st.session_state["order_haplotypes_started"] = True
-                st.rerun(scope="fragment")
-        elif "order_fmt_mode" in st.session_state:
-            # Selection was lost on navigation but the format choice is still valid.
-            st.caption(f"Format **{FORMAT_MODE}** retained from previous selection — select a row above to change.")
             if st.button(label, type="primary"):
                 st.session_state["order_haplotypes_started"] = True
                 st.rerun(scope="fragment")
@@ -416,16 +410,12 @@ def _build_section():
         st.rerun(scope="fragment")
 
     else:
-        st.caption(
-            f"All {len(_tokens)} file{'s' if len(_tokens) != 1 else ''} saved. "
-            "Switch to **Inspect** to browse and combine them."
-        )
-        if DEBUG:
-            with st.expander("Debug"):
-                for i in range(len(_tokens)):
-                    path = st.session_state.get(f"order_token_{i}_path")
-                    if path:
-                        st.write(f"Token {i}: `{path}`")
+        # All done — wipe state so the section resets to the format selector
+        for k in [k for k in st.session_state if k.startswith("order_token_")]:
+            del st.session_state[k]
+        st.session_state.pop("order_fmt_mode", None)
+        st.session_state["order_haplotypes_started"] = False
+        st.rerun(scope="fragment")
 
 
 _build_section()

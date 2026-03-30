@@ -459,7 +459,7 @@ def build_allele_matrix(
     Build a samples × positions DataFrame of called alleles.
 
     het_mode:
-      "exclude"  – het → "*", missing → "-"
+      "exclude"  – het → "#", missing → "-"
       "major_ad" – resolve het to the allele with higher depth (requires g1_wins)
 
     excluded_positions: set of position strings to omit entirely.
@@ -507,7 +507,7 @@ def build_allele_matrix(
                 ordered = np.array([f"{m}{het_sep}{n}" for m, n in zip(major, minor)], dtype=object)
                 calls   = np.where(missing, "-", np.where(het, ordered, a1))
             else:
-                calls = np.where(missing, "-", np.where(het, "*", a1))
+                calls = np.where(missing, "-", np.where(het, "#", a1))
 
             seen_positions.add(label)
             col_labels.append(label)

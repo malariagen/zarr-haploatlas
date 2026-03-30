@@ -6,7 +6,7 @@ from Bio.Seq import Seq
 
 REF_FASTA = "assets/PlasmoDB-54_Pfalciparum3D7_Genome.fasta"
 
-HET_SYMBOL = "*"   # displayed in allele matrix and haplotype columns
+HET_SYMBOL = "#"   # displayed in allele matrix and haplotype columns for het calls
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
@@ -100,14 +100,14 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
             continue
 
         # Strip trailing '-'/null padding; leave special markers untouched
-        if observed not in ("*", "-"):
+        if observed not in ("*", "#", "-"):
             observed = observed.rstrip("-\x00")
         ref_a = ref_a.rstrip("-\x00")
 
         off = info["offset"] + running_offset
 
-        # "*" covers both het and VCF spanning deletion — treat as reference
-        if observed in (ref_a, "*", "-"):
+        # "*" = VCF spanning deletion, "#" = het — both treated as reference
+        if observed in (ref_a, "*", "#", "-"):
             continue
 
         ref_len = len(ref_a)
@@ -154,7 +154,8 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
 
     Variant handling:
       - SNPs / indels          : applied with running-offset tracking
-      - Spanning del (*) / het (*) : treated as reference; range flagged with "*"
+      - Spanning del (*)            : treated as reference
+      - Het (#)                     : treated as reference; range flagged with "#"
       - Multi-allele ("G,T")   : treated as reference for full haplotype; per-position
                                   shows comma-separated translated AAs
       - Missing (-)            : whole locus / range result set to "-"
