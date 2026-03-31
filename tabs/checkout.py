@@ -1,12 +1,38 @@
+import io
 import os
 import re
+import zipfile
 import datetime
 import pandas as pd
 import streamlit as st
 
 from src.haplotype_summary import render_checkout_haplotype_summary
 
-HAPLOTYPES_DIR = "haplotypes"
+HAPLOTYPES_DIR  = "haplotypes"
+_META_CNV_PATH  = "assets/2026-03-31_pf9_meta_cnv_calls.tsv"
+_META_COLS      = ["Study", "Country", "Admin level 1", "Year", "Population",
+                   "QC pass", "Exclusion reason", "Sample type", "Sample was in Pf8"]
+_CNV_COLS       = ["CRT amplification", "GCH1 amplification", "MDR1 amplification",
+                   "PM2 PM3 amplification", "HRP2 deletion", "HRP3 deletion"]
+_CNV_VALUE_MAP  = {0: "FALSE", 1: "TRUE", -1: "UNDETERMINED"}
+
+
+@st.cache_data(show_spinner=False)
+def _load_meta_cnv() -> pd.DataFrame:
+    df = pd.read_csv(_META_CNV_PATH, sep="\t")
+    df = df.rename(columns={
+        "Sample": "sample_id",
+        "CRT_amplification":   "CRT amplification",
+        "GCH1_amplification":  "GCH1 amplification",
+        "MDR1_amplification":  "MDR1 amplification",
+        "PM2_PM3_amplification": "PM2 PM3 amplification",
+        "HRP2_deletion":       "HRP2 deletion",
+        "HRP3_deletion":       "HRP3 deletion",
+    })
+    for col in _CNV_COLS:
+        if col in df.columns:
+            df[col] = df[col].map(_CNV_VALUE_MAP).fillna(df[col])
+    return df
 
 # ── Filename parsing ──────────────────────────────────────────────────────────
 # Expected pattern: {loci}__{coord_type}__{format_mode}__{YYYYMMDD_HHMMSS}.tsv
@@ -88,9 +114,15 @@ def render():
     st.title("Checkout", anchor=False)
     st.caption("Browse saved haplotype files, select any combination, and download a single merged TSV.")
 
-    _poll_haplotypes_dir()
+    # ── Upload ────────────────────────────────────────────────────────────────
+    uploaded = st.file_uploader("Upload TSV", type=["tsv"], label_visibility="collapsed")
+    if uploaded is not None:
+        dest = os.path.join(HAPLOTYPES_DIR, uploaded.name)
+        with open(dest, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.success(f"Saved `{uploaded.name}`.")
 
-    os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
+    _poll_haplotypes_dir()
 
     tsv_files = sorted(
         [f for f in os.listdir(HAPLOTYPES_DIR) if f.endswith(".tsv")],
@@ -130,96 +162,114 @@ def render():
     selected_files   = [files_df.iloc[i]["filename"] for i in selected_indices]
 
     if not selected_files:
-        st.caption("Select one or more files above, then merge and download.")
+        st.caption("Select one or more files above to preview and download.")
         return
 
-    # ── Merge controls ────────────────────────────────────────────────────────
     st.divider()
 
     n_sel = len(selected_files)
-    if n_sel == 1:
-        st.subheader(f"Selected: `{selected_files[0]}`")
-    else:
-        gene_labels = [files_df.iloc[i]["gene"] for i in selected_indices]
-        st.subheader(f"Selected {n_sel} files: {', '.join(gene_labels)}")
 
-    # ── Merge ─────────────────────────────────────────────────────────────────
-    # Cache key: the sorted set of selected filenames. If the selection changes,
-    # the cached merge is stale and we show the Merge button again.
+    # ── Merge immediately on selection ────────────────────────────────────────
     _merge_cache_key = tuple(sorted(selected_files))
-    _merge_ready = (
-        st.session_state.get("checkout_merge_key") == _merge_cache_key
-        and "checkout_merged_df" in st.session_state
-    )
+    if st.session_state.get("checkout_merge_key") != _merge_cache_key:
+        dfs = []
+        load_errors = []
+        for fname in selected_files:
+            path = os.path.join(HAPLOTYPES_DIR, fname)
+            try:
+                dfs.append(pd.read_csv(path, sep="\t", low_memory=False))
+            except Exception as e:
+                load_errors.append(f"`{fname}`: {e}")
 
-    if not _merge_ready:
-        if st.button("Merge", type="primary"):
-            dfs = []
-            load_errors = []
-            for fname in selected_files:
-                path = os.path.join(HAPLOTYPES_DIR, fname)
-                try:
-                    dfs.append(pd.read_csv(path, sep="\t", low_memory=False))
-                except Exception as e:
-                    load_errors.append(f"`{fname}`: {e}")
+        for err in load_errors:
+            st.error(err)
 
-            for err in load_errors:
-                st.error(err)
+        if dfs:
+            all_non_sid = [set(df.columns) - {"sample_id"} for df in dfs]
+            conflict_cols = {
+                c for c in set().union(*all_non_sid)
+                if sum(c in cols for cols in all_non_sid) > 1
+            }
+            if conflict_cols:
+                labeled_dfs = []
+                for df, row_idx in zip(dfs, selected_indices):
+                    prefix = _safe_col_prefix(files_df.iloc[row_idx]["_loci_raw"])
+                    rename = {
+                        c: f"{c}__{prefix}"
+                        for c in df.columns
+                        if c != "sample_id" and c in conflict_cols
+                    }
+                    labeled_dfs.append(df.rename(columns=rename))
+                dfs = labeled_dfs
 
-            if dfs:
-                # Detect column conflicts (same non-sample_id column in 2+ files)
-                all_non_sid = [set(df.columns) - {"sample_id"} for df in dfs]
-                conflict_cols = {
-                    c for c in set().union(*all_non_sid)
-                    if sum(c in cols for cols in all_non_sid) > 1
-                }
-                if conflict_cols:
-                    labeled_dfs = []
-                    for df, row_idx in zip(dfs, selected_indices):
-                        prefix = _safe_col_prefix(files_df.iloc[row_idx]["_loci_raw"])
-                        rename = {
-                            c: f"{c}__{prefix}"
-                            for c in df.columns
-                            if c != "sample_id" and c in conflict_cols
-                        }
-                        labeled_dfs.append(df.rename(columns=rename))
-                    dfs = labeled_dfs
+            merged = dfs[0]
+            for df in dfs[1:]:
+                merged = merged.merge(df, on="sample_id", how="outer")
+            cols = ["sample_id"] + [c for c in merged.columns if c != "sample_id"]
+            merged = merged[cols].sort_values("sample_id").reset_index(drop=True)
 
-                merged = dfs[0]
-                for df in dfs[1:]:
-                    merged = merged.merge(df, on="sample_id", how="outer")
+            # Always join all meta/CNV columns — toggles filter downloads only
+            meta_cnv = _load_meta_cnv()
+            merged = merged.merge(
+                meta_cnv[["sample_id"] + _META_COLS + _CNV_COLS],
+                on="sample_id", how="left",
+            )
 
-                cols = ["sample_id"] + [c for c in merged.columns if c != "sample_id"]
-                merged = merged[cols].sort_values("sample_id").reset_index(drop=True)
+            all_loci = "+".join(
+                _safe_col_prefix(files_df.iloc[i]["_loci_raw"]) for i in selected_indices
+            )
+            ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            merged_name = selected_files[0] if n_sel == 1 else f"merged__{all_loci}__{ts_now}.tsv"
 
-                all_loci = "+".join(
-                    _safe_col_prefix(files_df.iloc[i]["_loci_raw"]) for i in selected_indices
-                )
-                ts_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                download_name = selected_files[0] if n_sel == 1 else f"merged__{all_loci}__{ts_now}.tsv"
+            st.session_state["checkout_merged_df"]   = merged
+            st.session_state["checkout_merged_name"] = merged_name
+            st.session_state["checkout_merge_key"]   = _merge_cache_key
 
-                st.session_state["checkout_merged_df"]   = merged
-                st.session_state["checkout_merged_name"] = download_name
-                st.session_state["checkout_merge_key"]   = _merge_cache_key
-                st.rerun()
+    # ── Preview + downloads ───────────────────────────────────────────────────
+    if "checkout_merged_df" in st.session_state:
+        merged      = st.session_state["checkout_merged_df"]
+        merged_name = st.session_state["checkout_merged_name"]
 
-    # ── Preview + download (shown once merge result is cached) ────────────────
-    if _merge_ready:
-        merged        = st.session_state["checkout_merged_df"]
-        download_name = st.session_state["checkout_merged_name"]
+        hap_cols = [c for c in merged.columns if c not in _META_COLS + _CNV_COLS]
+
+        tog1, tog2, dl1, dl2 = st.columns([1, 1, 2, 2])
+        inc_meta = tog1.toggle("Include metadata", value=True)
+        inc_cnv  = tog2.toggle("Include CNV calls", value=True)
+
+        # Columns to include based on toggles
+        dl_extra = ((_META_COLS if inc_meta else []) + (_CNV_COLS if inc_cnv else []))
+        dl_cols  = hap_cols + [c for c in dl_extra if c in merged.columns]
+        dl_df    = merged[dl_cols]
 
         st.caption(
-            f"{merged.shape[0]:,} samples × {merged.shape[1]} columns"
+            f"{dl_df.shape[0]:,} samples × {dl_df.shape[1]} columns"
             + (f" merged from {n_sel} files" if n_sel > 1 else "")
         )
-        st.dataframe(merged, hide_index=True, width="stretch")
+        st.dataframe(dl_df, hide_index=True, width="stretch")
 
-        tsv_out = merged.to_csv(sep="\t", index=False)
-        st.download_button(
-            "Download TSV",
-            tsv_out,
-            file_name=download_name,
+        dl1.download_button(
+            "Download merged",
+            dl_df.to_csv(sep="\t", index=False),
+            file_name=merged_name,
             mime="text/tab-separated-values",
+            use_container_width=True,
+            type="primary",
+        )
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in selected_files:
+                zf.write(os.path.join(HAPLOTYPES_DIR, fname), fname)
+            if dl_extra:
+                extra_df = merged[["sample_id"] + [c for c in dl_extra if c in merged.columns]]
+                zf.writestr("extra_columns.tsv", extra_df.to_csv(sep="\t", index=False))
+        zip_name = f"haplotypes_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        dl2.download_button(
+            "Download individual files",
+            zip_buf.getvalue(),
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True,
         )
 
         st.divider()
