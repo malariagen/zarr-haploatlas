@@ -1,4 +1,4 @@
-sample_id	dhps_436.437.540.581.613_haplotype	dhps_436.437.540.581.613_ns_changes	dhps_436	dhps_437	dhps_540	dhps_581	dhps_613
+sample_id	dhps_aa_436_437_540_581_613	dhps_aa_ns_changes	dhps_aa_436	dhps_aa_437	dhps_aa_540	dhps_aa_581	dhps_aa_613
 FP0008-C	[A/S],[A/G],K,A,A	S436[A/S], G437[A/G]	A,S	A,G	K	A	A
 FP0009-C	A,A,K,A,A	S436A, G437A	A	A	K	A	A
 FP0010-CW	S,G,K,A,A		S	G	K	A	A

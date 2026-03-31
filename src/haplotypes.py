@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 from Bio import SeqIO
@@ -259,7 +260,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
     # Skip individual-position columns for very wide (e.g. full-gene) queries
     _gen_per_pos = len(all_aa_positions) <= _MAX_PER_POS_COLS
     per_pos_lists: dict[str, list] = (
-        {f"{col_prefix}_{p}": [] for p in all_aa_positions} if _gen_per_pos else {}
+        {f"{col_prefix}_aa_{p}": [] for p in all_aa_positions} if _gen_per_pos else {}
     )
 
     haplotypes     = []
@@ -354,7 +355,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
 
         # Per-individual-position columns (skipped when _gen_per_pos is False)
         for aa_pos in (all_aa_positions if _gen_per_pos else []):
-            col_name    = f"{col_prefix}_{aa_pos}"
+            col_name    = f"{col_prefix}_aa_{aa_pos}"
             codon_vars  = aa_to_pos.get(aa_pos, [])
             pos_alleles = [alleles_here.get(p) for p in codon_vars]
 
@@ -391,10 +392,10 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
         haplotypes.append(",".join(hap_parts))
         ns_changes_col.append(ns_list)  # store as actual list, not str
 
-    pos_sum = _pos_summary(aa_ranges)
+    pos_sum_us = re.sub(r"[.\-]", "_", _pos_summary(aa_ranges))
     return {
-        f"{col_prefix}_{pos_sum}_haplotype":  haplotypes,
-        f"{col_prefix}_{pos_sum}_ns_changes": ns_changes_col,
+        f"{col_prefix}_aa_{pos_sum_us}":  haplotypes,
+        f"{col_prefix}_aa_ns_changes":    ns_changes_col,
         **per_pos_lists,
     }
 
@@ -430,12 +431,14 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
     # Per-interval column names (align with nt_ranges if available, else use intervals)
     range_source = nt_ranges if nt_ranges else [(iv[1], iv[2]) for iv in intervals]
     interval_col_names = [
-        _range_col_name(col_prefix, s, e) for s, e in range_source
+        f"{col_prefix}_nt_{s}" if s == e else f"{col_prefix}_nt_{s}_{e}"
+        for s, e in range_source
     ]
     # Pad/trim to match number of intervals
     while len(interval_col_names) < len(intervals):
         iv = intervals[len(interval_col_names)]
-        interval_col_names.append(_range_col_name(col_prefix, iv[1], iv[2]))
+        s, e = iv[1], iv[2]
+        interval_col_names.append(f"{col_prefix}_nt_{s}" if s == e else f"{col_prefix}_nt_{s}_{e}")
     interval_col_names = interval_col_names[:len(intervals)]
 
     per_iv_lists: dict[str, list] = {cn: [] for cn in interval_col_names}
@@ -487,8 +490,8 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
         haplotypes.append(",".join(parts) + suffix)
 
     range_source_for_summary = nt_ranges if nt_ranges else [(iv[1], iv[2]) for iv in intervals]
-    pos_sum = _pos_summary(range_source_for_summary)
-    return {
-        f"{col_prefix}_{pos_sum}_haplotype": haplotypes,
-        **per_iv_lists,
-    }
+    pos_sum_us = re.sub(r"[.\-]", "_", _pos_summary(range_source_for_summary))
+    hap_col_name = f"{col_prefix}_nt_{pos_sum_us}"
+    result = dict(per_iv_lists)
+    result[hap_col_name] = haplotypes  # for single interval, overwrites the identical per-iv col
+    return result

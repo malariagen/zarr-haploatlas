@@ -1,4 +1,4 @@
-sample_id	mdr1_86.1034.1042.1246_haplotype	mdr1_86.1034.1042.1246_ns_changes	mdr1_86	mdr1_1034	mdr1_1042	mdr1_1246
+sample_id	mdr1_aa_86_1034_1042_1246	mdr1_aa_ns_changes	mdr1_aa_86	mdr1_aa_1034	mdr1_aa_1042	mdr1_aa_1246
 FP0008-C	N,S,N,D		N	S	N	D
 FP0009-C	Y,S,N,Y	N86Y, D1246Y	Y	S	N	Y
 FP0010-CW	[Y/N],S,N,D	N86[Y/N]	Y,N	S	N	D

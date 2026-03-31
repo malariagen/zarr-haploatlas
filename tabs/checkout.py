@@ -86,10 +86,69 @@ def _safe_col_prefix(loci_raw: str) -> str:
     return re.sub(r'[^A-Za-z0-9]', '_', loci_raw)
 
 
+def _rename_columns_for_coord_type(df: pd.DataFrame, parsed: dict) -> pd.DataFrame:
+    """Rename old-style TSV columns to embed the coord type.
+
+    Old-style                              → New-style
+    dhps_436.437.540_haplotype            → dhps_aa_436_437_540
+    dhps_436.437.540_ns_changes           → dhps_aa_ns_changes
+    dhps_436                              → dhps_aa_436
+    primer1_20000-20020_haplotype         → primer1_nt_20000_20020
+    primer1_20000_20020  (NT interval)    → primer1_nt_20000_20020
+    """
+    coord_type = parsed.get("type", "?")
+    if coord_type not in ("aa", "nt", "mixed"):
+        return df
+
+    rename: dict[str, str] = {}
+    for col in df.columns:
+        if col == "sample_id":
+            continue
+        # Skip columns already using the new scheme
+        if re.search(r"_(aa|nt|mixed)_", col):
+            continue
+
+        # {alias}_{pos_sum}_haplotype  →  {alias}_{ct}_{pos_sum_us}
+        m = re.match(r"^(.+?)_([\d][\d.\-]*)_haplotype$", col)
+        if m:
+            pos_str = re.sub(r"[.\-]", "_", m.group(2))
+            rename[col] = f"{m.group(1)}_{coord_type}_{pos_str}"
+            continue
+
+        # {alias}_{pos_sum}_ns_changes  →  {alias}_{ct}_ns_changes
+        m = re.match(r"^(.+?)_([\d][\d.\-]*)_ns_changes$", col)
+        if m:
+            rename[col] = f"{m.group(1)}_{coord_type}_ns_changes"
+            continue
+
+        # NT per-interval range: {alias}_{start}_{end}  →  {alias}_{ct}_{start}_{end}
+        if coord_type in ("nt", "mixed"):
+            m = re.match(r"^([A-Za-z][A-Za-z0-9]*)_(\d+)_(\d+)$", col)
+            if m:
+                rename[col] = f"{m.group(1)}_{coord_type}_{m.group(2)}_{m.group(3)}"
+                continue
+
+        # Single per-position AA: {alias}_{pos}  →  {alias}_{ct}_{pos}
+        m = re.match(r"^([A-Za-z][A-Za-z0-9]*)_(\d+)$", col)
+        if m:
+            rename[col] = f"{m.group(1)}_{coord_type}_{m.group(2)}"
+            continue
+
+    return df.rename(columns=rename)
+
+
 def _is_mutation_column(col_name: str) -> bool:
     if col_name == "sample_id":
         return False
+    # Old-style haplotype / ns_changes
     if col_name.endswith("_haplotype") or col_name.endswith("_ns_changes"):
+        return False
+    # New-style multi-position haplotype: gene_aa_436_437 or gene_nt_2000_2020
+    base = col_name.split("__")[0]
+    if re.search(r"_(aa|nt|mixed)_\d+_\d+", base):
+        return False
+    # New-style ns_changes: gene_aa_ns_changes
+    if re.search(r"_(aa|nt|mixed)_ns_changes", col_name):
         return False
     if col_name.startswith("Unnamed"):
         return False
@@ -177,7 +236,9 @@ def render():
         for fname in selected_files:
             path = os.path.join(HAPLOTYPES_DIR, fname)
             try:
-                dfs.append(pd.read_csv(path, sep="\t", low_memory=False))
+                df = pd.read_csv(path, sep="\t", low_memory=False)
+                df = _rename_columns_for_coord_type(df, _parse_filename(fname))
+                dfs.append(df)
             except Exception as e:
                 load_errors.append(f"`{fname}`: {e}")
 
@@ -275,8 +336,8 @@ def render():
         st.divider()
         st.subheader("Haplotype summary")
         st.caption(
-            "Select mutation columns (for example `dhps_456`, `dhps_459`, `dhfr_724`) "
-            "to build haplotype combinations and visualise them as a Bokeh haplotype summary view."
+            "Select mutation columns (for example `dhps_aa_456`, `dhps_aa_459`, `dhfr_aa_724`) "
+            "to build haplotype combinations and visualise them as a haplotype summary view."
         )
 
         mutation_candidates = [c for c in merged.columns if _is_mutation_column(c)]
@@ -306,7 +367,7 @@ def render():
             st.info("Select at least two mutation columns in the table above.")
             return
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
         min_samples = c1.number_input(
             "Minimum samples per haplotype",
             min_value=1,
@@ -321,10 +382,29 @@ def render():
             value=15,
             step=1,
         )
+        het_mode = c3.radio(
+            "Het positions",
+            ["Exclude", "Collapse", "Expand"],
+            horizontal=True,
+        )
+        exclude_bad = c4.checkbox(
+            "Exclude samples with missing, stop codons, or spanning deletions"
+        )
+
+        available_meta = [c for c in _META_COLS + _CNV_COLS if c in merged.columns]
+        meta_col_raw = st.selectbox(
+            "Show distribution by",
+            ["(none)"] + available_meta,
+            format_func=lambda x: "— none —" if x == "(none)" else x,
+        )
+        meta_col = None if meta_col_raw == "(none)" else meta_col_raw
 
         render_checkout_haplotype_summary(
             merged_df=merged,
             mutation_columns=selected_mutation_cols,
             min_samples=int(min_samples),
             max_haplotypes=int(max_haplotypes),
+            het_mode=het_mode,
+            exclude_bad=exclude_bad,
+            meta_col=meta_col,
         )

@@ -1,4 +1,4 @@
-sample_id	dhfr_51.59.108.164_haplotype	dhfr_51.59.108.164_ns_changes	dhfr_51	dhfr_59	dhfr_108	dhfr_164
+sample_id	dhfr_aa_51_59_108_164	dhfr_aa_ns_changes	dhfr_aa_51	dhfr_aa_59	dhfr_aa_108	dhfr_aa_164
 FP0008-C	N,C,[S/N],I	S108[S/N]	N	C	S,N	I
 FP0009-C	I,R,N,I	N51I, C59R, S108N	I	R	N	I
 FP0010-CW	I,R,N,I	N51I, C59R, S108N	I	R	N	I
