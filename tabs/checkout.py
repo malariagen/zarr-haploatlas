@@ -388,7 +388,8 @@ def render():
             horizontal=True,
         )
         exclude_bad = c4.checkbox(
-            "Exclude samples with missing, stop codons, or spanning deletions"
+            "Exclude samples with missing, stop codons, or spanning deletions",
+            value = True
         )
 
         available_meta = [c for c in _META_COLS + _CNV_COLS if c in merged.columns]

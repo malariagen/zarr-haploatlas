@@ -295,11 +295,25 @@ def _prepare_haplotype_summary_data(
     work[mutation_columns] = norm_mut2
     work["haplotype_key"] = norm_mut2.agg("|".join, axis=1)
 
-    grouped = (
+    # Group solely by haplotype_key so that haplotypes made identical by het
+    # handling (e.g. Collapse) are merged into one bar.  Including mutation
+    # columns as additional groupby keys risks splitting what should be a single
+    # haplotype when pandas StringDtype NA representations differ slightly.
+    hap_counts = (
         work
-        .groupby(["haplotype_key", *mutation_columns], dropna=False, sort=False)
+        .groupby("haplotype_key", dropna=False, sort=False)
         .size()
         .reset_index(name="sample_count")
+    )
+    hap_alleles = (
+        work
+        .groupby("haplotype_key", dropna=False, sort=False)[mutation_columns]
+        .first()
+        .reset_index()
+    )
+    grouped = (
+        hap_counts
+        .merge(hap_alleles, on="haplotype_key")
         .sort_values("sample_count", ascending=False)
     )
     grouped = grouped[grouped["sample_count"] >= min_samples].head(max_haplotypes).reset_index(drop=True)
