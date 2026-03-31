@@ -26,6 +26,7 @@ def deduplicate_allele_matrix(allele_matrix: pd.DataFrame) -> pd.DataFrame:
         .groupby(pos_cols, sort=False)["sample_id"]
         .agg(n_samples="count", sample_ids=list)
         .reset_index()
+        .copy()
     )
 
 
