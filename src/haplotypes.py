@@ -308,7 +308,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     else:
                         chars.append(_aa_at(alt_aa, aa_p))
                 hap_parts.append("".join(chars))
-            elif has_ordered and mode in ("default", "wide"):
+            elif has_ordered and mode in ("default", "expand"):
                 # Build char-by-char: het positions show [major/minor]
                 chars = []
                 for aa_p in range(aa_start, aa_end + 1):

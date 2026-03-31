@@ -13,7 +13,7 @@ HAPLOTYPES_DIR = "haplotypes"
 # Double-underscore is the field separator; gene names may contain single underscores.
 
 _FNAME_RE = re.compile(
-    r'^(?P<loci>.+?)__(?P<coord_type>aa|nt|mixed)__(?P<fmt>default|skip|collapse|wide)__'
+    r'^(?P<loci>.+?)__(?P<coord_type>aa|nt|mixed)__(?P<fmt>default|skip|collapse|wide|expand)__'
     r'(?P<ts>\d{8}_\d{6})\.tsv$'
 )
 # loci field has the form {gene_label}_{pos_summary}, e.g. crt_72.74 or 0709000_76-93.
@@ -74,12 +74,21 @@ def _is_mutation_column(col_name: str) -> bool:
 
 # ── Page ─────────────────────────────────────────────────────────────────────
 
+@st.fragment(run_every=2)
+def _poll_haplotypes_dir() -> None:
+    """Trigger a full rerun whenever the haplotypes directory gains or loses files."""
+    os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
+    current = sorted(f for f in os.listdir(HAPLOTYPES_DIR) if f.endswith(".tsv"))
+    if current != st.session_state.get("checkout_tsv_snapshot"):
+        st.session_state["checkout_tsv_snapshot"] = current
+        st.rerun()
+
+
 def render():
     st.title("Checkout", anchor=False)
     st.caption("Browse saved haplotype files, select any combination, and download a single merged TSV.")
 
-    if st.button("Refresh file list"):
-        st.rerun()
+    _poll_haplotypes_dir()
 
     os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
 

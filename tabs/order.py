@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import datetime
+import time
 import pandas as pd
 import streamlit as st
 
@@ -125,6 +126,7 @@ def _run_build_job(
     apply_numalt1: bool,
 ):
     try:
+        job_start = time.monotonic()
         _job_log(f"Build started for {len(tokens)} token(s); format={format_mode}.")
         for i, token in enumerate(tokens):
             if job_state["cancel"]:
@@ -132,10 +134,14 @@ def _run_build_job(
                 _job_log("Build cancelled by user.")
                 return
 
+            def _prog(p, t):
+                job_state["tokens"][i]["progress"]      = p
+                job_state["tokens"][i]["progress_text"] = t
+
+            token_start = time.monotonic()
             job_state["current_i"] = i
             job_state["tokens"][i]["state"] = "running"
-            job_state["progress"] = 0.0
-            job_state["progress_text"] = "Parsing locus…"
+            _prog(0.0, "Parsing locus…")
             _job_log(f"[{i+1}/{len(tokens)}] Processing {token}")
 
             parsed_t   = parse_loci_from_input(token)
@@ -168,8 +174,7 @@ def _run_build_job(
                     job_state["status"] = "cancelled"
                     _job_log("Build cancelled by user.")
                     return
-                job_state["progress"]      = j / n_steps
-                job_state["progress_text"] = f"Loading {sid}…"
+                _prog(j / n_steps, f"Loading {sid}…")
                 region   = regions_t[sid]
                 _pos_key = tuple(region["meta"]["positions"].tolist())
                 region["genotypes"], region["g1_wins"] = load_call_data(
@@ -183,14 +188,17 @@ def _run_build_job(
                 _job_log("Build cancelled by user.")
                 return
 
-            job_state["progress"]      = n_r / n_steps
-            job_state["progress_text"] = "Building allele matrix…"
+            _prog(n_r / n_steps, "Building allele matrix…")
             am = build_allele_matrix(regions_t, excluded_positions, het_mode, het_sep)
             for r in regions_t.values():
                 r["genotypes"] = r["g1_wins"] = None
 
-            job_state["progress"]      = (n_r + 1) / n_steps
-            job_state["progress_text"] = "Computing haplotypes…"
+            if job_state["cancel"]:
+                job_state["status"] = "cancelled"
+                _job_log("Build cancelled by user.")
+                return
+
+            _prog((n_r + 1) / n_steps, "Computing haplotypes…")
             deduped_t = deduplicate_allele_matrix(am)
             am        = None
 
@@ -209,16 +217,20 @@ def _run_build_job(
             fpath = os.path.join(HAPLOTYPES_DIR, fname)
             _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
 
-            job_state["tokens"][i]["state"] = "done"
-            job_state["tokens"][i]["path"]  = fpath
-            job_state["progress"]           = 1.0
-            job_state["progress_text"]      = "Done"
-            _job_log(f"[{i+1}/{len(tokens)}] Saved {fpath}")
+            token_elapsed = time.monotonic() - token_start
+            # Set state to done atomically — progress fields are now irrelevant and
+            # the UI only reads them when state == "running".
+            job_state["tokens"][i].update({
+                "state":   "done",
+                "path":    fpath,
+                "elapsed": token_elapsed,
+            })
+            _job_log(f"[{i+1}/{len(tokens)}] Saved {fpath} ({token_elapsed:.1f}s)")
 
+        job_elapsed = time.monotonic() - job_start
         job_state["status"]    = "done"
         job_state["current_i"] = None
-        job_state["progress"]  = None
-        _job_log("Build completed.")
+        _job_log(f"Build completed in {job_elapsed:.1f}s.")
 
     except Exception as exc:
         job_state["status"] = "error"
@@ -379,13 +391,13 @@ def render():
             "format of '_ns_changes' column": "G42-, K43T, M56#, C58K",
         }, {
             "format strategy": "collapse",
-            "description": "Resolve het to hom using the major allele",
+            "description": "Collapse het to hom using the major allele",
             "speed": "slower",
             "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
             "format of '_haplotype' column": "-T,TGK",
             "format of '_ns_changes' column": "G42-, K43T, M56T, C58K",
         }, {
-            "format strategy": "wide",
+            "format strategy": "expand",
             "description": "Expand het positions to two separate ns_changes entries",
             "speed": "slower",
             "format of mutation position column, e.g., PF3D7_XXXXXXX_56": "T,M",
@@ -415,7 +427,7 @@ def render():
         FORMAT_MODE = st.session_state.get("order_fmt_mode", "default")
 
     _HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
-                     "collapse": "major_ad",   "wide": "ordered_ad"}
+                     "collapse": "major_ad",  "expand": "ordered_ad"}
     HET_MODE = _HET_MODE_MAP[FORMAT_MODE]
     HET_SEP  = "/"
 
@@ -442,15 +454,14 @@ def render():
                 type="primary",
             ):
                 new_job: dict = {
-                    "cancel":        False,
-                    "n_tokens":      n_tok,
-                    "status":        "running",
-                    "current_i":     None,
-                    "progress":      None,
-                    "progress_text": None,
-                    "error":         None,
+                    "cancel":    False,
+                    "n_tokens":  n_tok,
+                    "status":    "running",
+                    "current_i": None,
+                    "error":     None,
                     "tokens": {
-                        i: {"state": "pending", "path": None, "warnings": [], "error": None}
+                        i: {"state": "pending", "path": None, "warnings": [], "error": None,
+                            "progress": None, "progress_text": None}
                         for i in range(n_tok)
                     },
                 }
@@ -479,53 +490,54 @@ def render():
             st.caption("Select a format strategy above to enable building.")
         return
 
-    # ── Render per-token status ────────────────────────────────────────────────
-    n_tokens = job_state["n_tokens"]
-    status   = job_state["status"]
+    # ── Render per-token status (fragment auto-polls the background thread) ─────
+    @st.fragment(run_every=0.5)
+    def _render_job_status(token_labels: list[str]) -> None:
+        js = st.session_state.get("order_job_state")
+        if js is None:
+            return
 
-    for i in range(n_tokens):
-        tok   = job_state["tokens"].get(i, {})
-        state = tok.get("state", "pending")
-        label = f"({i+1}/{n_tokens}) `{tokens[i]}`"
+        n = js["n_tokens"]
+        status = js["status"]
 
-        for w in tok.get("warnings", []):
-            st.warning(w)
+        for i in range(n):
+            tok   = js["tokens"].get(i, {})
+            state = tok.get("state", "pending")
+            label = f"({i+1}/{n}) `{token_labels[i]}`"
 
-        if state == "done":
-            if tok["path"]:
-                st.success(f"{label} → `{tok['path']}`")
-            else:
+            for w in tok.get("warnings", []):
+                st.warning(w)
+
+            if state == "done":
+                if tok["path"]:
+                    elapsed = tok.get("elapsed")
+                    timing = f" ({elapsed:.1f}s)" if elapsed is not None else ""
+                    st.success(f"{label} → `{tok['path']}`{timing}")
+                else:
+                    st.warning(f"{label} → no variants found, skipped.")
+            elif state == "skipped":
                 st.warning(f"{label} → no variants found, skipped.")
-        elif state == "skipped":
-            st.warning(f"{label} → no variants found, skipped.")
-        elif state == "error":
-            st.error(f"{label} → {tok.get('error')}")
-        elif state == "running":
-            prog = job_state.get("progress")
-            text = job_state.get("progress_text") or f"Building {label}…"
-            if prog is not None:
-                st.progress(prog, text=text)
-            else:
-                st.info(f"Building {label}…")
-        # pending: no output — avoids cluttering the UI before a token starts
+            elif state == "error":
+                st.error(f"{label} → {tok.get('error')}")
+            elif state == "running":
+                prog = tok.get("progress")
+                text = tok.get("progress_text") or f"Building {label}…"
+                if prog is not None:
+                    st.progress(prog, text=text)
+                else:
+                    st.info(f"Building {label}…")
 
-    if status == "done":
-        return
+        if status == "error":
+            st.error(f"Build error: {js.get('error')}")
+            if st.button("Dismiss"):
+                st.session_state.pop("order_job_state", None)
+                st.rerun()
+            return
 
-    if status in ("cancelled", "error"):
-        if status == "cancelled":
-            st.warning("Build was cancelled.")
-        else:
-            st.error(f"Build error: {job_state.get('error')}")
-        if st.button("Dismiss"):
-            st.session_state.pop("order_job_state", None)
-            st.rerun()
-        return
+        if status != "done":
+            if st.button("Cancel build"):
+                js["cancel"] = True
+                st.session_state.pop("order_job_state", None)
+                st.rerun()
 
-    # Running: if cancel was already requested show feedback; otherwise offer button.
-    if job_state.get("cancel"):
-        st.warning("Cancelling…")
-    else:
-        if st.button("Cancel build"):
-            job_state["cancel"] = True
-            st.rerun()
+    _render_job_status(tokens)
