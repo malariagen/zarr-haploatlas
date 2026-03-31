@@ -216,6 +216,7 @@ def _run_build_job(
             fname = _token_to_filename(token, format_mode)
             fpath = os.path.join(HAPLOTYPES_DIR, fname)
             _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
+            raw_t = regions_t = None
 
             token_elapsed = time.monotonic() - token_start
             # Set state to done atomically — progress fields are now irrelevant and
