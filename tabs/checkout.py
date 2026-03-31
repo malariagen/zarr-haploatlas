@@ -341,8 +341,8 @@ def render():
         )
 
         mutation_candidates = [c for c in merged.columns if _is_mutation_column(c)]
-        if len(mutation_candidates) > 5:
-            st.info("Too many mutation columns to plot a haplotype summary.")
+        if len(mutation_candidates) < 1:
+            st.info("Need at least one mutation-like columns in the merged data to plot a haplotype summary.")
             return
 
         st.caption("Select columns directly in the table below (multi-column selection enabled).")
