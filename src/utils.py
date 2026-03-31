@@ -43,8 +43,15 @@ def load_variant_data():
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
 
+_CHUNK_INDEX_PATH = "assets/chunk_index.csv"
+
+
 @st.cache_data(show_spinner="Building chunk index from zarr...", persist="disk")
 def build_chunk_index() -> pd.DataFrame:
+    import os
+    if os.path.exists(_CHUNK_INDEX_PATH):
+        return pd.read_csv(_CHUNK_INDEX_PATH)
+
     pf8 = malariagen_data.Pf8()
     variant_data = pf8.variant_calls()
 
@@ -82,7 +89,9 @@ def build_chunk_index() -> pd.DataFrame:
         progress.progress((i + 1) / n_chunks, text=f"Chunk {i + 1} / {n_chunks}")
 
     progress.empty()
-    return pd.DataFrame(chunk_index)
+    df = pd.DataFrame(chunk_index)
+    df.to_csv(_CHUNK_INDEX_PATH, index=False)
+    return df
 
 
 # ── Locus parsing & resolution ────────────────────────────────────────────────

@@ -7,11 +7,7 @@ import datetime
 import pandas as pd
 import streamlit as st
 
-try:
-    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
-except Exception:  # pragma: no cover
-    add_script_run_ctx = None
-    get_script_run_ctx = None
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 from src.utils import (
     build_chunk_index, load_reference_files, load_variant_data,
@@ -41,6 +37,7 @@ def _make_per_sample_df(raw: pd.DataFrame) -> pd.DataFrame:
         .explode("sample_ids")
         .rename(columns={"sample_ids": "sample_id"})
         .drop(columns=["n_samples"])
+        .sort_values("sample_id")
         .reset_index(drop=True)
     )
 
@@ -513,10 +510,6 @@ def render():
         # pending: no output — avoids cluttering the UI before a token starts
 
     if status == "done":
-        if st.button("Build new haplotypes"):
-            st.session_state.pop("order_job_state", None)
-            st.session_state.pop("order_fmt_mode", None)
-            st.rerun()
         return
 
     if status in ("cancelled", "error"):
