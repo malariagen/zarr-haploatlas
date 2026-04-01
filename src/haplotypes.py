@@ -220,6 +220,33 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
 
 # ── AA loci ───────────────────────────────────────────────────────────────────
 
+def _clip_alleles_at_exon_boundaries(alleles: dict, pos_info: dict) -> dict:
+    """Clip alleles for positions whose REF was truncated to the exonic portion.
+
+    When a VCF REF allele spans an exon-intron boundary, pos_info stores the
+    clipped (exonic) REF length in 'exon_clip_len'.  ALT alleles from the
+    allele matrix must be clipped to the same length so _apply_variants uses the
+    correct ref_len and computes running_offset accurately.
+
+    Special markers (*, #, -, multi-allele ",", ordered-het "/") are passed
+    through unchanged — they are handled by _apply_variants' own logic.
+    """
+    out = {}
+    for pos_str, allele in alleles.items():
+        clip = pos_info.get(pos_str, {}).get("exon_clip_len")
+        if (
+            clip is not None
+            and isinstance(allele, str)
+            and allele not in ("*", "#", "-")
+            and "," not in allele
+            and "/" not in allele
+            and len(allele) > clip
+        ):
+            allele = allele[:clip]
+        out[pos_str] = allele
+    return out
+
+
 def _range_col_name(source_id: str, start: int, end: int) -> str:
     return f"{source_id}_{start}" if start == end else f"{source_id}_{start}_{end}"
 
@@ -248,19 +275,33 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
     exons = cds_gff[cds_gff["gene_id"] == source_id].copy()
     exons = exons.sort_values("start", ascending=True)
 
-    # Map queried variant positions to 0-based CDS offsets
+    # Map queried variant positions to 0-based CDS offsets.
+    # Long REF alleles that span an exon-intron boundary are clipped to the exonic
+    # portion: only the bases within the exon affect the CDS.  exon_clip_len records
+    # the clip length so that ALT alleles can be clipped to the same length before
+    # being applied (see _clip_alleles_at_exon_boundaries).
     pos_info = {}
     for vi, pos in enumerate(meta["positions"]):
         cds_off = _genomic_to_cds_offset(int(pos), exons, strand)
         if cds_off is None:
             continue
-        pos_info[str(pos)] = {"ref": str(meta["alleles"][vi][0]), "offset": cds_off}
+        ref_full = str(meta["alleles"][vi][0])
+        ref_clip = ref_full
+        for _, exon in exons.iterrows():
+            if int(exon["start"]) <= int(pos) <= int(exon["end"]):
+                exon_remaining = int(exon["end"]) - int(pos) + 1
+                if len(ref_full) > exon_remaining:
+                    ref_clip = ref_full[:exon_remaining]
+                break
+        entry: dict = {"ref": ref_clip, "offset": cds_off}
+        if len(ref_clip) < len(ref_full):
+            entry["exon_clip_len"] = len(ref_clip)
+        pos_info[str(pos)] = entry
 
     sorted_pos_info = sorted(pos_info.items(), key=lambda x: x[1]["offset"])
 
     # Light sanity check: CDS structure and REF alleles vs reference sequence.
-    # Both SNPs and indels are checked — the VCF REF allele (always + strand) must
-    # match the CDS at the given offset for the length of the REF allele.
+    # After exon-boundary clipping the clipped REF should match the CDS exactly.
     if len(ref_cds) % 3 != 0:
         print(f"WARNING {source_id}: CDS length {len(ref_cds)} nt not divisible by 3")
     elif ref_aa and ref_aa[0] != "M":
@@ -318,13 +359,16 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                              for p, v in alleles_here.items()}
             alleles_minor = {p: v.split(het_sep)[1] if p in ordered_pos else v
                              for p, v in alleles_here.items()}
-            alt_aa_major = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_major), strand)
-            alt_aa_minor = _translate(_apply_variants(ref_cds, sorted_pos_info, alleles_minor), strand)
+            alt_aa_major = _translate(_apply_variants(ref_cds, sorted_pos_info,
+                _clip_alleles_at_exon_boundaries(alleles_major, pos_info)), strand)
+            alt_aa_minor = _translate(_apply_variants(ref_cds, sorted_pos_info,
+                _clip_alleles_at_exon_boundaries(alleles_minor, pos_info)), strand)
         else:
             alt_aa_major = alt_aa_minor = None
 
         # het_sep alleles are treated as reference by _apply_variants
-        alt_cds = _apply_variants(ref_cds, sorted_pos_info, alleles_here)
+        alt_cds = _apply_variants(ref_cds, sorted_pos_info,
+                                  _clip_alleles_at_exon_boundaries(alleles_here, pos_info))
         alt_aa  = _translate(alt_cds, strand)
 
         hap_parts = []
@@ -427,7 +471,8 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     for p, v in multi_vars.items():
                         opts = v.split(",")
                         test[p] = opts[idx] if idx < len(opts) else opts[-1]
-                    alt_cds_t = _apply_variants(ref_cds, sorted_pos_info, test)
+                    alt_cds_t = _apply_variants(ref_cds, sorted_pos_info,
+                                               _clip_alleles_at_exon_boundaries(test, pos_info))
                     alt_aa_t  = _translate(alt_cds_t, strand)
                     aa_opts.append(_aa_at(alt_aa_t, aa_pos, ref_protein_len))
                 per_pos_lists[col_name].append(",".join(aa_opts))
