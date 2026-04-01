@@ -1,4 +1,5 @@
 import re
+import warnings
 import streamlit as st
 import pandas as pd
 from Bio import SeqIO
@@ -21,14 +22,16 @@ def deduplicate_allele_matrix(allele_matrix: pd.DataFrame) -> pd.DataFrame:
       - sample_ids: list of their IDs
     """
     pos_cols = list(allele_matrix.columns)
-    return (
-        allele_matrix
-        .reset_index(names="sample_id")
-        .groupby(pos_cols, sort=False)["sample_id"]
-        .agg(n_samples="count", sample_ids=list)
-        .reset_index()
-        .copy()
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
+        return (
+            allele_matrix
+            .reset_index(names="sample_id")
+            .groupby(pos_cols, sort=False)["sample_id"]
+            .agg(n_samples="count", sample_ids=list)
+            .reset_index()
+            .copy()
+        )
 
 
 # ── Reference helpers ─────────────────────────────────────────────────────────
