@@ -131,12 +131,17 @@ def parse_loci_from_input(user_input: str) -> pd.DataFrame:
 
 
 def _compute_gene_aa_length(gene_id: str, cds_gff: pd.DataFrame) -> int:
-    """Return the number of amino acids encoded by a gene's CDS."""
+    """Return the protein length (AA count, excluding stop codon) for a gene.
+
+    PlasmoDB CDS annotations include the stop codon in the exon coordinates,
+    so we subtract one codon from the total to get the protein-coding length.
+    """
     exons = cds_gff[cds_gff["gene_id"] == gene_id]
     if exons.empty:
         return 0
     total_nt = sum(int(row["end"]) - int(row["start"]) + 1 for _, row in exons.iterrows())
-    return total_nt // 3
+    n_codons = total_nt // 3
+    return max(0, n_codons - 1)  # exclude stop codon
 
 
 def expand_full_gene_loci(parsed_loci: pd.DataFrame, cds_gff: pd.DataFrame) -> pd.DataFrame:

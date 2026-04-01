@@ -120,18 +120,35 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
     return "".join(seq_chars)
 
 
-def _aa_at(alt_aa: str, pos: int) -> str:
-    """Return amino acid at 1-based position, '!' if beyond sequence (premature stop)."""
-    if pos < 1 or pos > len(alt_aa):
+def _aa_at(alt_aa: str, pos: int, ref_len: int | None = None) -> str:
+    """Return amino acid at 1-based position.
+
+    Returns '!' for:
+      - premature stop / frameshift (alt_aa shorter than expected)
+      - the gene's own stop codon position (pos == ref_len + 1, alt full-length)
+      - stop-lost ref side (ref_len given, pos == ref_len + 1)
+
+    '!' is the stop/termination token throughout; '*' is reserved for spanning deletions.
+    If ref_len is given, position ref_len + 1 always returns '!' regardless of alt length
+    (distinguishing "gene stop" from "premature stop" is left to the caller via ref_a).
+    """
+    if pos < 1:
         return "!"
-    return alt_aa[pos - 1]
+    if pos <= len(alt_aa):
+        return alt_aa[pos - 1]
+    return "!"
 
 
-def _aa_slice(alt_aa: str, start: int, end: int) -> str:
-    """Return AA substring for 1-based inclusive [start, end], '!' if truncated."""
-    if start < 1 or end > len(alt_aa):
+def _aa_slice(alt_aa: str, start: int, end: int, ref_len: int | None = None) -> str:
+    """Return AA substring for 1-based inclusive [start, end].
+
+    Positions beyond alt_aa render as '!'. The result is returned as-is; any '!'
+    in the string indicates truncation (premature stop, frameshift, or gene stop codon).
+    ref_len is accepted for API symmetry with _aa_at but has no effect here.
+    """
+    if start < 1:
         return "!"
-    return alt_aa[start - 1 : end]
+    return "".join(_aa_at(alt_aa, pos) for pos in range(start, end + 1))
 
 
 # ── Haplotype computation ─────────────────────────────────────────────────────
@@ -161,7 +178,7 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
       - Multi-allele ("G,T")   : treated as reference for full haplotype; per-position
                                   shows comma-separated translated AAs
       - Missing (-)            : whole locus / range result set to "-"
-      - Stop codon (premature) : positions beyond the stop shown as "X"
+      - Stop codon / frameshift : '!' — premature stop, frameshift, or gene stop codon
     """
     ref_genome  = load_ref_genome(ref_fasta_path)
     result      = deduped.copy()
@@ -226,6 +243,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
         return {}
     ref_cds, strand = cds_result
     ref_aa = _translate(ref_cds, strand)
+    ref_protein_len = len(ref_aa)  # excludes stop codon (to_stop=True)
 
     exons = cds_gff[cds_gff["gene_id"] == source_id].copy()
     exons = exons.sort_values("start", ascending=True)
@@ -239,6 +257,28 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
         pos_info[str(pos)] = {"ref": str(meta["alleles"][vi][0]), "offset": cds_off}
 
     sorted_pos_info = sorted(pos_info.items(), key=lambda x: x[1]["offset"])
+
+    # Light sanity check: CDS structure and REF alleles vs reference sequence.
+    # Both SNPs and indels are checked — the VCF REF allele (always + strand) must
+    # match the CDS at the given offset for the length of the REF allele.
+    if len(ref_cds) % 3 != 0:
+        print(f"WARNING {source_id}: CDS length {len(ref_cds)} nt not divisible by 3")
+    elif ref_aa and ref_aa[0] != "M":
+        print(f"WARNING {source_id}: reference protein does not start with Met (got '{ref_aa[0]}')")
+    else:
+        mismatches = []
+        for pos_str, info in pos_info.items():
+            ref_allele = info["ref"].rstrip("-\x00")
+            offset = info["offset"]
+            cds_slice = ref_cds[offset : offset + len(ref_allele)]
+            if cds_slice.upper() != ref_allele.upper():
+                mismatches.append(f"pos {pos_str} (VCF={ref_allele!r}, CDS={cds_slice!r})")
+        if mismatches:
+            print(
+                f"WARNING {source_id}: {len(mismatches)} REF allele(s) don't match CDS: "
+                + "; ".join(mismatches[:3])
+                + (" …" if len(mismatches) > 3 else "")
+            )
 
     cds_len = len(ref_cds)
     aa_to_pos: dict[int, list[str]] = {}
@@ -308,7 +348,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     if any(alleles_here.get(p) == "-" for p in cvars):
                         chars.append("-")
                     else:
-                        chars.append(_aa_at(alt_aa, aa_p))
+                        chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
             elif has_ordered and mode in ("default", "expand"):
                 # Build char-by-char: het positions show [major/minor]
@@ -316,18 +356,18 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                 for aa_p in range(aa_start, aa_end + 1):
                     cvars = aa_to_pos.get(aa_p, [])
                     if any(p in ordered_pos for p in cvars):
-                        aa_m = _aa_at(alt_aa_major, aa_p)
-                        aa_n = _aa_at(alt_aa_minor, aa_p)
+                        aa_m = _aa_at(alt_aa_major, aa_p, ref_protein_len)
+                        aa_n = _aa_at(alt_aa_minor, aa_p, ref_protein_len)
                         chars.append(f"[{aa_m}/{aa_n}]" if aa_m != aa_n else aa_m)
                     else:
-                        chars.append(_aa_at(alt_aa, aa_p))
+                        chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
             elif has_het or has_ordered or has_multi:
                 # skip/collapse modes: collapse the whole range to "*"
                 hap_parts.append(HET_SYMBOL)
             else:
-                hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end)
-                                  if aa_start != aa_end else _aa_at(alt_aa, aa_start))
+                hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end, ref_protein_len)
+                                  if aa_start != aa_end else _aa_at(alt_aa, aa_start, ref_protein_len))
 
             # ns_changes for each individual AA position in this range
             for aa_pos in range(aa_start, aa_end + 1):
@@ -335,16 +375,21 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                 is_missing  = any(alleles_here.get(p) == "-" for p in codon_vars)
                 is_het      = any(alleles_here.get(p) == HET_SYMBOL for p in codon_vars)
                 is_ordered  = any(p in ordered_pos for p in codon_vars)
-                ref_a = ref_aa[aa_pos - 1] if len(ref_aa) >= aa_pos else "?"
-                alt_a = _aa_at(alt_aa, aa_pos)
+                if aa_pos <= ref_protein_len:
+                    ref_a = ref_aa[aa_pos - 1]
+                elif aa_pos == ref_protein_len + 1:
+                    ref_a = "!"  # gene stop codon position
+                else:
+                    ref_a = "?"
+                alt_a = _aa_at(alt_aa, aa_pos, ref_protein_len)
 
                 if is_missing:
                     ns_list.append(f"{ref_a}{aa_pos}-")
                 elif is_het:
                     ns_list.append(f"{ref_a}{aa_pos}{HET_SYMBOL}")
                 elif is_ordered:
-                    aa_m = _aa_at(alt_aa_major, aa_pos)
-                    aa_n = _aa_at(alt_aa_minor, aa_pos)
+                    aa_m = _aa_at(alt_aa_major, aa_pos, ref_protein_len)
+                    aa_n = _aa_at(alt_aa_minor, aa_pos, ref_protein_len)
                     if aa_m == aa_n:
                         if aa_m != ref_a:
                             ns_list.append(f"{ref_a}{aa_pos}{aa_m}")
@@ -369,8 +414,8 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             elif has_het:
                 per_pos_lists[col_name].append(HET_SYMBOL)
             elif is_ordered:
-                aa_m = _aa_at(alt_aa_major, aa_pos)
-                aa_n = _aa_at(alt_aa_minor, aa_pos)
+                aa_m = _aa_at(alt_aa_major, aa_pos, ref_protein_len)
+                aa_n = _aa_at(alt_aa_minor, aa_pos, ref_protein_len)
                 per_pos_lists[col_name].append(f"{aa_m},{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
@@ -384,10 +429,10 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                         test[p] = opts[idx] if idx < len(opts) else opts[-1]
                     alt_cds_t = _apply_variants(ref_cds, sorted_pos_info, test)
                     alt_aa_t  = _translate(alt_cds_t, strand)
-                    aa_opts.append(_aa_at(alt_aa_t, aa_pos))
+                    aa_opts.append(_aa_at(alt_aa_t, aa_pos, ref_protein_len))
                 per_pos_lists[col_name].append(",".join(aa_opts))
             else:
-                per_pos_lists[col_name].append(_aa_at(alt_aa, aa_pos))
+                per_pos_lists[col_name].append(_aa_at(alt_aa, aa_pos, ref_protein_len))
 
         haplotypes.append(",".join(hap_parts))
         ns_changes_col.append(ns_list)  # store as actual list, not str
