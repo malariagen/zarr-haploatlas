@@ -6,3 +6,4 @@ dask
 numpy
 pandas
 xarray
+authlib
