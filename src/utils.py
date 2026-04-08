@@ -34,11 +34,27 @@ def load_reference_files() -> dict:
     }
 
 
+def _gcs_credentials():
+    """Return GCS credentials for the current user.
+
+    On Streamlit Cloud the Google OAuth access token is forwarded so GCS
+    authenticates as the logged-in user (bucket access is per-account).
+    Locally falls back to Application Default Credentials.
+    """
+    tokens = getattr(st.user, "tokens", None)
+    if tokens and "access" in tokens:
+        import google.oauth2.credentials as oauth2_creds
+        return oauth2_creds.Credentials(token=tokens["access"]["token"])
+    return None  # malariagen_data will use google.auth.default()
+
+
 @st.cache_resource(show_spinner="Connecting to variant data…")
 def load_variant_data():
     # cache_resource keeps a single reference; cache_data would pickle the entire
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
-    return malariagen_data.Pf9().variant_calls()
+    creds = _gcs_credentials()
+    kwargs = {"token": creds} if creds is not None else {}
+    return malariagen_data.Pf9(**kwargs).variant_calls()
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
@@ -52,7 +68,9 @@ def build_chunk_index() -> pd.DataFrame:
     if os.path.exists(_CHUNK_INDEX_PATH):
         return pd.read_csv(_CHUNK_INDEX_PATH)
 
-    pf9 = malariagen_data.Pf9()
+    creds = _gcs_credentials()
+    kwargs = {"token": creds} if creds is not None else {}
+    pf9 = malariagen_data.Pf9(**kwargs)
     variant_data = pf9.variant_calls()
 
     pos_var    = variant_data["variant_position"]
