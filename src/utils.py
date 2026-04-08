@@ -35,24 +35,11 @@ def load_reference_files() -> dict:
 
 
 def _gcs_credentials():
-    """Return GCS credentials for the current user.
-
-    On Streamlit Cloud the Google OAuth access token is forwarded so GCS
-    authenticates as the logged-in user (bucket access is per-account).
-    Locally falls back to Application Default Credentials.
-    """
-    st.write(f"DEBUG st.user contents: {dict(st.user)}")
     tokens = getattr(st.user, "tokens", None)
-    st.write(f"DEBUG tokens keys: {list(tokens.keys()) if tokens else 'None'}")
     if tokens and "access" in tokens:
         token_info = tokens["access"]
-        st.write(f"DEBUG access token keys: {list(token_info.keys())}")
-        import google.oauth2.credentials as oauth2_creds
-        creds = oauth2_creds.Credentials(token=token_info["token"])
-        st.write(f"DEBUG credentials created, valid={creds.valid}, scopes={creds.scopes}")
-        return creds
-    st.write("DEBUG no access token found, falling back to ADC")
-    return None  # malariagen_data will use google.auth.default()
+        st.write(f"DEBUG token_info type: {type(token_info)}, repr: {repr(token_info)}")
+    return None
 
 
 @st.cache_resource(show_spinner="Connecting to variant data…")
@@ -61,14 +48,7 @@ def load_variant_data():
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
     creds = _gcs_credentials()
     kwargs = {"token": creds} if creds is not None else {}
-    st.write(f"DEBUG calling Pf9 with kwargs keys: {list(kwargs.keys())}")
-    try:
-        result = malariagen_data.Pf9(**kwargs).variant_calls()
-        st.write("DEBUG variant_calls() succeeded")
-        return result
-    except Exception as e:
-        st.write(f"DEBUG variant_calls() failed: {e}")
-        raise
+    return malariagen_data.Pf9(**kwargs).variant_calls()
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
