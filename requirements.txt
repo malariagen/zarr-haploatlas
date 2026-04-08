@@ -1,4 +1,4 @@
-malariagen_data==15.6.0
+git+https://github.com/malariagen/malariagen-data-python.git
 streamlit==1.54.0
 bokeh
 biopython
