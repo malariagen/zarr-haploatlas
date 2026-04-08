@@ -38,7 +38,7 @@ def load_reference_files() -> dict:
 def load_variant_data():
     # cache_resource keeps a single reference; cache_data would pickle the entire
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
-    return malariagen_data.Pf8().variant_calls()
+    return malariagen_data.Pf9().variant_calls()
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
