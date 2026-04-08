@@ -8,7 +8,7 @@ st.logo("assets/logo.svg", size="large")
 
 if not st.user.is_logged_in:
     st.title("Variant Marketplace")
-    st.button("Sign in with Google", on_click=st.login, args=["google"])
+    st.button("Sign in with Google", on_click=st.login)
     st.stop()
 
 with st.sidebar:
