@@ -34,15 +34,15 @@ def load_reference_files() -> dict:
 
 
 def _open_variant_calls():
-    """Open the Pf9 variant calls zarr store directly via gcsfs.
+    """Open the Pf9 variant calls zarr store directly via gcsfs + zarr.
 
-    Uses the logged-in user's OAuth access token when available (Streamlit Cloud),
-    falling back to Application Default Credentials for local development.
-    This bypasses malariagen_data's internal google.auth.default() call, which
-    times out on Streamlit Cloud when no GCE metadata service is present.
+    Uses zarr.open_consolidated (same as malariagen_data internally) to avoid
+    an xarray/zarr version incompatibility in xr.open_zarr. Uses the logged-in
+    user's OAuth access token on Streamlit Cloud, ADC locally.
     """
     import gcsfs
-    import xarray as xr
+    import zarr
+    import dask.array as da
 
     tokens = getattr(st.user, "tokens", None)
     if tokens and "access" in tokens:
@@ -53,7 +53,27 @@ def _open_variant_calls():
 
     fs = gcsfs.GCSFileSystem(token=token)
     store = fs.get_mapper("pf9-release/zarr/")
-    return xr.open_zarr(store)
+    root = zarr.open_consolidated(store=store)
+
+    ref = da.from_zarr(root["variants/REF"])
+    alt = da.from_zarr(root["variants/ALT"])
+
+    return xr.Dataset(
+        data_vars={
+            "variant_allele":      (["variants", "alleles"],              da.concatenate([ref[:, None], alt], axis=1)),
+            "variant_is_snp":      (["variants"],                         da.from_zarr(root["variants/is_snp"])),
+            "variant_filter_pass": (["variants"],                         da.from_zarr(root["variants/FILTER_PASS"])),
+            "variant_CDS":         (["variants"],                         da.from_zarr(root["variants/CDS"])),
+            "variant_numalt":      (["variants"],                         da.from_zarr(root["variants/numalt"])),
+            "call_genotype":       (["variants", "samples", "ploidy"],    da.from_zarr(root["calldata/GT"])),
+            "call_AD":             (["variants", "samples", "alleles"],   da.from_zarr(root["calldata/AD"])),
+        },
+        coords={
+            "variant_position": (["variants"], da.from_zarr(root["variants/POS"])),
+            "variant_chrom":    (["variants"], da.from_zarr(root["variants/CHROM"])),
+            "sample_id":        (["samples"],  da.from_zarr(root["samples"])),
+        }
+    )
 
 
 @st.cache_resource(show_spinner="Connecting to variant data…")
