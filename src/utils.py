@@ -52,8 +52,8 @@ def build_chunk_index() -> pd.DataFrame:
     if os.path.exists(_CHUNK_INDEX_PATH):
         return pd.read_csv(_CHUNK_INDEX_PATH)
 
-    pf8 = malariagen_data.Pf8()
-    variant_data = pf8.variant_calls()
+    pf9 = malariagen_data.Pf9()
+    variant_data = pf9.variant_calls()
 
     pos_var    = variant_data["variant_position"]
     chrom_var  = variant_data["variant_chrom"]
