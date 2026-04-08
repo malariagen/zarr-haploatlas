@@ -35,11 +35,12 @@ def load_reference_files() -> dict:
 
 
 def _gcs_credentials():
+    """Return GCS credentials for the current user's OAuth token, or None for local ADC."""
     tokens = getattr(st.user, "tokens", None)
     if tokens and "access" in tokens:
-        token_info = tokens["access"]
-        st.write(f"DEBUG token_info type: {type(token_info)}, repr: {repr(token_info)}")
-    return None
+        import google.oauth2.credentials as oauth2_creds
+        return oauth2_creds.Credentials(token=tokens["access"])
+    return None  # local dev: malariagen_data will use google.auth.default()
 
 
 @st.cache_resource(show_spinner="Connecting to variant data…")
