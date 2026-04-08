@@ -41,6 +41,7 @@ def _gcs_credentials():
     authenticates as the logged-in user (bucket access is per-account).
     Locally falls back to Application Default Credentials.
     """
+    st.write(f"DEBUG st.user contents: {dict(st.user)}")
     tokens = getattr(st.user, "tokens", None)
     st.write(f"DEBUG tokens keys: {list(tokens.keys()) if tokens else 'None'}")
     if tokens and "access" in tokens:
