@@ -42,9 +42,15 @@ def _gcs_credentials():
     Locally falls back to Application Default Credentials.
     """
     tokens = getattr(st.user, "tokens", None)
+    st.write(f"DEBUG tokens keys: {list(tokens.keys()) if tokens else 'None'}")
     if tokens and "access" in tokens:
+        token_info = tokens["access"]
+        st.write(f"DEBUG access token keys: {list(token_info.keys())}")
         import google.oauth2.credentials as oauth2_creds
-        return oauth2_creds.Credentials(token=tokens["access"]["token"])
+        creds = oauth2_creds.Credentials(token=token_info["token"])
+        st.write(f"DEBUG credentials created, valid={creds.valid}, scopes={creds.scopes}")
+        return creds
+    st.write("DEBUG no access token found, falling back to ADC")
     return None  # malariagen_data will use google.auth.default()
 
 
@@ -54,7 +60,14 @@ def load_variant_data():
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
     creds = _gcs_credentials()
     kwargs = {"token": creds} if creds is not None else {}
-    return malariagen_data.Pf9(**kwargs).variant_calls()
+    st.write(f"DEBUG calling Pf9 with kwargs keys: {list(kwargs.keys())}")
+    try:
+        result = malariagen_data.Pf9(**kwargs).variant_calls()
+        st.write("DEBUG variant_calls() succeeded")
+        return result
+    except Exception as e:
+        st.write(f"DEBUG variant_calls() failed: {e}")
+        raise
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
