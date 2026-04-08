@@ -44,12 +44,14 @@ def _open_variant_calls():
     import zarr
     import dask.array as da
 
-    tokens = getattr(st.user, "tokens", None)
-    if tokens and "access" in tokens:
-        import google.oauth2.credentials as oauth2_creds
-        token = oauth2_creds.Credentials(token=tokens["access"])
+    if "gcp_service_account" in st.secrets:
+        import google.oauth2.service_account as sa
+        token = sa.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
     else:
-        token = None  # gcsfs will use ADC (works locally after gcloud auth)
+        token = None  # local dev: gcsfs will use ADC
 
     fs = gcsfs.GCSFileSystem(token=token)
     store = fs.get_mapper("pf9-release/zarr/")
