@@ -2,7 +2,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import xarray as xr
-import malariagen_data
 import re
 
 
@@ -34,22 +33,34 @@ def load_reference_files() -> dict:
     }
 
 
-def _gcs_credentials():
-    """Return GCS credentials for the current user's OAuth token, or None for local ADC."""
+def _open_variant_calls():
+    """Open the Pf9 variant calls zarr store directly via gcsfs.
+
+    Uses the logged-in user's OAuth access token when available (Streamlit Cloud),
+    falling back to Application Default Credentials for local development.
+    This bypasses malariagen_data's internal google.auth.default() call, which
+    times out on Streamlit Cloud when no GCE metadata service is present.
+    """
+    import gcsfs
+    import xarray as xr
+
     tokens = getattr(st.user, "tokens", None)
     if tokens and "access" in tokens:
         import google.oauth2.credentials as oauth2_creds
-        return oauth2_creds.Credentials(token=tokens["access"])
-    return None  # local dev: malariagen_data will use google.auth.default()
+        token = oauth2_creds.Credentials(token=tokens["access"])
+    else:
+        token = None  # gcsfs will use ADC (works locally after gcloud auth)
+
+    fs = gcsfs.GCSFileSystem(token=token)
+    store = fs.get_mapper("pf9-release/zarr/")
+    return xr.open_zarr(store)
 
 
 @st.cache_resource(show_spinner="Connecting to variant data…")
 def load_variant_data():
     # cache_resource keeps a single reference; cache_data would pickle the entire
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
-    creds = _gcs_credentials()
-    kwargs = {"token": creds} if creds is not None else {}
-    return malariagen_data.Pf9(**kwargs).variant_calls()
+    return _open_variant_calls()
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
@@ -63,10 +74,7 @@ def build_chunk_index() -> pd.DataFrame:
     if os.path.exists(_CHUNK_INDEX_PATH):
         return pd.read_csv(_CHUNK_INDEX_PATH)
 
-    creds = _gcs_credentials()
-    kwargs = {"token": creds} if creds is not None else {}
-    pf9 = malariagen_data.Pf9(**kwargs)
-    variant_data = pf9.variant_calls()
+    variant_data = _open_variant_calls()
 
     pos_var    = variant_data["variant_position"]
     chrom_var  = variant_data["variant_chrom"]

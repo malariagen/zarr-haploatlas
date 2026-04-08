@@ -1,4 +1,5 @@
 git+https://github.com/malariagen/malariagen-data-python.git
+gcsfs
 streamlit[auth]==1.54.0
 bokeh
 biopython
