@@ -527,73 +527,100 @@ def _compute_phasing_status(
     return result
 
 
+_SAMPLE_CHUNK_SIZE = 100  # chunk size for in-memory dedup loop
+
+
 @st.cache_data
 def load_call_data(
     _ds: xr.Dataset, cache_key: tuple,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load genotypes and allele-depth data.
+    Load genotypes and allele-depth data for all samples at once.
+
+    Loading all samples in one call lets zarr fetch all sample-chunks in parallel
+    (concurrent HTTP requests on GCS-backed stores).  Splitting into per-chunk
+    requests serialises that I/O and is significantly slower.
 
     Args:
-        _ds:       xr.Dataset for the region. Prefixed with _ so Streamlit excludes it
-                   from the cache key (xr.Dataset is not hashable).
-        cache_key: stable hashable key that uniquely identifies this dataset —
-                   pass (source_id, apply_filter_pass, apply_numalt1) from the caller.
-                   Must change whenever _ds changes.
+        _ds:       xr.Dataset for the region (prefixed with _ to exclude from cache key).
+        cache_key: stable hashable key — pass (source_id, apply_filter_pass,
+                   apply_numalt1, pos_tuple) from the caller.
 
     Returns:
         genotypes: (n_variants, n_samples, 2) int8
-        g1_wins:   (n_variants, n_samples) bool — True where first called allele has
-                   >= depth than the second.
-        ad_g1:     (n_variants, n_samples) int — AD for the first called allele index.
-        ad_g2:     (n_variants, n_samples) int — AD for the second called allele index.
+        g1_wins:   (n_variants, n_samples) bool
+        ad_g1:     (n_variants, n_samples) int
+        ad_g2:     (n_variants, n_samples) int
     """
     genotypes = _ds["call_genotype"].values.astype(np.int8)
-    ad = _ds["call_AD"].values  # (n_variants, n_samples, n_alleles)
+    ad        = _ds["call_AD"].values          # (n_variants, n_samples, n_alleles)
 
-    n_v, n_s   = genotypes.shape[:2]
-    n_alleles  = ad.shape[2]
-    vi         = np.arange(n_v)[:, None]
-    si         = np.arange(n_s)[None, :]
+    n_v, n_s  = genotypes.shape[:2]
+    n_alleles = ad.shape[2]
+    vi        = np.arange(n_v)[:, None]
+    si        = np.arange(n_s)[None, :]
     g1 = np.minimum(genotypes[:, :, 0].clip(0), n_alleles - 1)
     g2 = np.minimum(genotypes[:, :, 1].clip(0), n_alleles - 1)
 
-    ad_g1   = ad[vi, si, g1]          # (n_variants, n_samples)
+    ad_g1   = ad[vi, si, g1]
     ad_g2   = ad[vi, si, g2]
-    g1_wins = ad_g1 >= ad_g2          # (n_variants, n_samples) bool
+    g1_wins = ad_g1 >= ad_g2
     return genotypes, g1_wins, ad_g1, ad_g2
 
 
 def build_allele_matrix(
     regions: dict,
     excluded_positions: set[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    progress_cb=None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
-    Build a samples × positions DataFrame of called alleles, plus a parallel
-    phasing-status DataFrame.
+    Build a deduplicated allele table and a per-sample phasing-status DataFrame.
+
+    Data must already be loaded into ``region["genotypes"]`` etc. (via
+    ``load_call_data``).  Samples are processed in Python chunks of
+    ``_SAMPLE_CHUNK_SIZE`` so that the full allele matrix is never materialised;
+    unique allele combinations are folded into a dict as each chunk is processed.
+    The result is the deduped format that ``compute_haplotypes`` expects
+    (position columns + ``n_samples`` + ``sample_ids``), with no separate
+    deduplication pass required.
 
     Het calls are encoded as "major/minor" ordered by allele depth.
     Missing calls are encoded as "-".
 
-    excluded_positions: set of position strings to omit entirely.
+    Args:
+        regions:            dict mapping source_id → region dict with pre-loaded
+                            ``genotypes``, ``g1_wins``, ``ad_g1``, ``ad_g2``.
+        excluded_positions: set of position strings to omit entirely.
+        progress_cb:        optional callable(fraction: float, text: str) called
+                            after each sample chunk (~540 calls for 53 k samples).
 
     Returns:
-        allele_matrix:  (n_samples × n_positions) DataFrame of called allele strings
-        phasing_matrix: same shape; values "hom" / "het:safe" / "het:unsafe" / "-".
+        deduped:        DataFrame — one row per unique allele combination, with
+                        position columns plus ``n_samples`` (int) and
+                        ``sample_ids`` (list[str]).
+        phasing_matrix: (n_samples × n_positions) DataFrame indexed by sample_id,
+                        values "hom" / "het:safe" / "het:unsafe" / "-"; or None
+                        when there are no position columns.
     """
     excluded_positions = excluded_positions or set()
-    col_labels: list[str] = []
-    col_arrays: list      = []
-    phasing_arrays: list  = []
+
+    # ── Phase 1: collect per-variant metadata and pre-compute call arrays ─────
+    # Build the full per-variant arrays once (they are small — n_variants is tiny).
+    # Sample iteration happens in Phase 2 over these arrays.
+    col_labels: list[str]  = []
     seen_positions: set[str] = set()
     sample_ids = None
 
+    # per-column arrays accumulated once across all regions
+    call_arrays:    list[np.ndarray] = []   # each (n_samples,) object
+    phasing_arrays: list[np.ndarray] = []   # each (n_samples,) object
+
     for region in regions.values():
         meta      = region["meta"]
-        genotypes = region["genotypes"]   # (n_variants, n_samples, 2)
-        g1_wins   = region["g1_wins"]     # (n_variants, n_samples) bool
-        ad_g1     = region["ad_g1"]       # (n_variants, n_samples) int
-        ad_g2     = region["ad_g2"]       # (n_variants, n_samples) int
+        genotypes = region["genotypes"]    # (n_variants, n_samples, 2)
+        g1_wins   = region["g1_wins"]
+        ad_g1     = region["ad_g1"]
+        ad_g2     = region["ad_g2"]
         positions = meta["positions"]
 
         if sample_ids is None:
@@ -618,23 +645,74 @@ def build_allele_matrix(
             missing = (gt1 < 0) | (gt2 < 0)
             het     = ~missing & (a1 != a2)
 
-            major   = np.where(g1_wins[vi], a1, a2)
-            minor   = np.where(g1_wins[vi], a2, a1)
+            g1w     = g1_wins[vi]
+            major   = np.where(g1w, a1, a2)
+            minor   = np.where(g1w, a2, a1)
             ordered = np.array([f"{m}/{n}" for m, n in zip(major, minor)], dtype=object)
             calls   = np.where(missing, "-", np.where(het, ordered, a1))
 
             seen_positions.add(label)
             col_labels.append(label)
-            col_arrays.append(np.asarray(calls, dtype=object))
+            call_arrays.append(np.asarray(calls, dtype=object))
             phasing_arrays.append(
-                _compute_phasing_status(het, missing, ad_g1[vi], ad_g2[vi], g1_wins[vi])
+                _compute_phasing_status(het, missing, ad_g1[vi], ad_g2[vi], g1w)
             )
 
-    empty_idx = sample_ids if sample_ids is not None else []
-    if not col_arrays:
-        empty = pd.DataFrame(np.empty((len(empty_idx), 0), dtype=object), index=empty_idx, columns=[])
-        return empty, empty.copy()
+    n_positions = len(col_labels)
 
-    allele_matrix  = pd.DataFrame(np.column_stack(col_arrays),   index=sample_ids, columns=col_labels)
-    phasing_matrix = pd.DataFrame(np.column_stack(phasing_arrays), index=sample_ids, columns=col_labels)
-    return allele_matrix, phasing_matrix
+    if n_positions == 0 or sample_ids is None:
+        return pd.DataFrame(columns=["n_samples", "sample_ids"]), None
+
+    n_samples = len(sample_ids)
+    # Stack: (n_positions, n_samples) — column-major so row-slicing is a simple index
+    calls_matrix   = np.stack(call_arrays,   axis=0)   # (n_pos, n_samples)
+    phasing_matrix_np = np.stack(phasing_arrays, axis=0)  # (n_pos, n_samples)
+
+    # ── Phase 2: iterate over sample chunks, fold into dedup dict ─────────────
+    dedup: dict[tuple, dict] = {}
+    phasing_chunks: list[pd.DataFrame] = []
+    n_chunks = (n_samples + _SAMPLE_CHUNK_SIZE - 1) // _SAMPLE_CHUNK_SIZE
+
+    for chunk_i in range(n_chunks):
+        chunk_start = chunk_i * _SAMPLE_CHUNK_SIZE
+        chunk_end   = min(chunk_start + _SAMPLE_CHUNK_SIZE, n_samples)
+        chunk_ids   = sample_ids[chunk_start:chunk_end]
+
+        # Slice already-loaded arrays — no I/O
+        chunk_calls   = calls_matrix[:, chunk_start:chunk_end]    # (n_pos, chunk_size)
+        chunk_phasing = phasing_matrix_np[:, chunk_start:chunk_end]
+
+        chunk_size = chunk_end - chunk_start
+        for s in range(chunk_size):
+            key = tuple(chunk_calls[:, s])
+            if key in dedup:
+                dedup[key]["n"] += 1
+                dedup[key]["ids"].append(str(chunk_ids[s]))
+            else:
+                dedup[key] = {"n": 1, "ids": [str(chunk_ids[s])]}
+
+        phasing_chunks.append(
+            pd.DataFrame(chunk_phasing.T, index=chunk_ids, columns=col_labels)
+        )
+
+        if progress_cb is not None:
+            progress_cb(
+                (chunk_i + 1) / n_chunks,
+                f"Deduplicating samples {chunk_end:,} / {n_samples:,}…",
+            )
+
+    # ── Phase 3: assemble outputs ─────────────────────────────────────────────
+    rows = [
+        {**dict(zip(col_labels, key)), "n_samples": info["n"], "sample_ids": info["ids"]}
+        for key, info in dedup.items()
+    ]
+    deduped = pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=col_labels + ["n_samples", "sample_ids"]
+    )
+
+    phasing_out: pd.DataFrame | None = None
+    if phasing_chunks:
+        phasing_out = pd.concat(phasing_chunks)
+        phasing_out.index.name = "sample_id"
+
+    return deduped, phasing_out

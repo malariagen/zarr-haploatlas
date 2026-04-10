@@ -165,9 +165,8 @@ def _run_build_job(
                 _job_log(f"[{i+1}/{len(tokens)}] Skipped: no regions/variants found.")
                 continue
 
-            rids    = list(regions_t.keys())
-            n_r     = len(rids)
-            n_steps = n_r + 2
+            rids = list(regions_t.keys())
+            n_r  = len(rids)
             _job_log(f"[{i+1}/{len(tokens)}] Resolved {n_r} region(s); loading calls.")
 
             for j, sid in enumerate(rids):
@@ -175,7 +174,7 @@ def _run_build_job(
                     job_state["status"] = "cancelled"
                     _job_log("Build cancelled by user.")
                     return
-                _prog(j / n_steps, f"Loading {sid}…")
+                _prog(j / n_r * 0.7, f"Loading {sid}…")
                 region   = regions_t[sid]
                 _pos_key = tuple(region["meta"]["positions"].tolist())
                 (region["genotypes"],
@@ -191,40 +190,40 @@ def _run_build_job(
                 _job_log("Build cancelled by user.")
                 return
 
-            _prog(n_r / n_steps, "Building allele matrix…")
-            am, phasing_matrix = build_allele_matrix(regions_t, excluded_positions)
+            _prog(0.7, "Deduplicating…")
+            deduped_t, phasing_matrix = build_allele_matrix(
+                regions_t,
+                excluded_positions,
+                progress_cb=lambda p, t: _prog(0.7 + p * 0.2, t),
+            )
             for r in regions_t.values():
                 r["genotypes"] = r["g1_wins"] = r["ad_g1"] = r["ad_g2"] = None
 
             # ── Build reference row (all REF alleles, virtual sample "_REF") ──────
+            pos_cols = [c for c in deduped_t.columns if c not in ("n_samples", "sample_ids")]
+            pos_cols_set = set(pos_cols)
             ref_alleles: dict[str, str] = {}
             for region in regions_t.values():
                 for vi, pos in enumerate(region["meta"]["positions"]):
                     ps = str(pos)
-                    if ps in am.columns:
+                    if ps in pos_cols_set:
                         ref_alleles[ps] = str(region["meta"]["alleles"][vi][0]).rstrip("-\x00")
             ref_am = pd.DataFrame(
-                [{c: ref_alleles.get(c, "-") for c in am.columns}],
+                [{c: ref_alleles.get(c, "-") for c in pos_cols}],
                 index=["_REF"],
             )
 
-            # ── Save raw allele matrix to .debug/ ────────────────────────────────
+            # ── Save deduped allele matrix to .debug/ ────────────────────────────
             debug_dir = ".debug"
             os.makedirs(debug_dir, exist_ok=True)
             debug_fname = _token_to_filename(token).replace(".tsv", "__raw_alleles.tsv")
             debug_fpath = os.path.join(debug_dir, debug_fname)
-            debug_am = pd.concat([ref_am, am])
-            if phasing_matrix is not None:
-                phasing_renamed = phasing_matrix.rename(
-                    columns={c: f"{c}_phasing" for c in phasing_matrix.columns}
-                )
-                phasing_ref_row = pd.DataFrame(
-                    [{f"{c}_phasing": "hom" for c in phasing_matrix.columns}],
-                    index=["_REF"],
-                )
-                debug_am = pd.concat([debug_am, pd.concat([phasing_ref_row, phasing_renamed])], axis=1)
-            debug_am.index.name = "sample_id"
-            debug_am.reset_index().to_csv(debug_fpath, sep="\t", index=False)
+            ref_debug_row = ref_am.copy()
+            ref_debug_row["n_samples"] = 1
+            ref_debug_row["sample_ids"] = [["_REF"]]
+            debug_am = pd.concat([ref_debug_row, deduped_t], ignore_index=False)
+            debug_am.index.name = "combo_id"
+            debug_am.reset_index(drop=True).to_csv(debug_fpath, sep="\t", index=False)
             _job_log(f"[{i+1}/{len(tokens)}] Debug allele matrix saved to {debug_fpath}")
 
             if job_state["cancel"]:
@@ -232,9 +231,7 @@ def _run_build_job(
                 _job_log("Build cancelled by user.")
                 return
 
-            _prog((n_r + 1) / n_steps, "Computing haplotypes…")
-            deduped_t = deduplicate_allele_matrix(am)
-            am        = None
+            _prog(0.9, "Computing haplotypes…")
 
             raw_t = compute_haplotypes(
                 deduped_t, regions_t, resolved_t, parsed_t,
