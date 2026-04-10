@@ -43,20 +43,20 @@ def _make_per_sample_df(raw: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _token_to_filename(token: str, format_mode: str) -> str:
+def _token_to_filename(token: str) -> str:
     """Derive a filename from a single token string.
 
-    Pattern: {gene_label}_{pos_summary}__{coord_type}__{format_mode}__{YYYYMMDD_HHMMSS}.tsv
+    Pattern: {gene_label}_{pos_summary}__{coord_type}__{YYYYMMDD_HHMMSS}.tsv
 
     gene_label  = alias if given, else the portion of the gene/chrom ID after PF3D7_/Pf3D7_.
     pos_summary = positions with spaces stripped, commas replaced by dots, '*' → 'all'.
     Double-underscore (__) is the field separator; single underscores may appear within fields.
 
     Examples:
-      PF3D7_0709000[72,74](crt)   → crt_72.74__aa__default__20260330_143022.tsv
-      PF3D7_0709000[76-93]        → 0709000_76-93__aa__default__20260330_143023.tsv
-      PF3D7_0709000[*](dhfr)      → dhfr_all__aa__default__20260330_143024.tsv
-      Pf3D7_04_v3[104205,139150]  → 04_v3_104205.139150__nt__default__20260330_143025.tsv
+      PF3D7_0709000[72,74](crt)   → crt_72.74__aa__20260330_143022.tsv
+      PF3D7_0709000[76-93]        → 0709000_76-93__aa__20260330_143023.tsv
+      PF3D7_0709000[*](dhfr)      → dhfr_all__aa__20260330_143024.tsv
+      Pf3D7_04_v3[104205,139150]  → 04_v3_104205.139150__nt__20260330_143025.tsv
     """
     alias_m = re.search(r'\(([^)]+)\)$', token)
     alias = alias_m.group(1) if alias_m else None
@@ -77,13 +77,17 @@ def _token_to_filename(token: str, format_mode: str) -> str:
     pos_summary = "all" if pos_part == "*" else re.sub(r'\s+', '', pos_part).replace(',', '.')
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{gene_label}_{pos_summary}__{coord_type}__{format_mode}__{ts}.tsv"
+    return f"{gene_label}_{pos_summary}__{coord_type}__{ts}.tsv"
 
 
 _NS_HET_RE = re.compile(r'^([A-Za-z?])(\d+)([A-Za-z*\-])\/([A-Za-z*\-])$')
 
 
-def _format_ns_changes(val, mode: str) -> str:
+def _format_ns_changes(val) -> str:
+    """Format a raw ns_changes list into a human-readable string.
+
+    Het entries stored as 'K76I/K' are rendered as 'K76[I/K]'.
+    """
     if isinstance(val, list):
         changes = val
     else:
@@ -98,11 +102,8 @@ def _format_ns_changes(val, mode: str) -> str:
     parts = []
     for entry in changes:
         m = _NS_HET_RE.match(entry)
-        if m and mode == "default":
+        if m:
             parts.append(f"{m.group(1)}{m.group(2)}[{m.group(3)}/{m.group(4)}]")
-        elif m and mode == "wide":
-            parts.append(f"{m.group(1)}{m.group(2)}{m.group(3)}")
-            parts.append(f"{m.group(1)}{m.group(2)}{m.group(4)}")
         else:
             parts.append(entry)
     return ", ".join(parts)
@@ -112,6 +113,9 @@ def _format_ns_changes(val, mode: str) -> str:
 # Runs in a daemon thread so tab switches don't interrupt it.
 # Must not call any st.* function — communicates only via the job_state dict.
 
+_HET_SEP = "/"
+
+
 def _run_build_job(
     job_state: dict,
     tokens: list,
@@ -119,15 +123,12 @@ def _run_build_job(
     variant_data,
     chunk_index_df,
     excluded_positions: set,
-    het_mode: str,
-    het_sep: str,
-    format_mode: str,
     apply_filter_pass: bool,
     apply_numalt1: bool,
 ):
     try:
         job_start = time.monotonic()
-        _job_log(f"Build started for {len(tokens)} token(s); format={format_mode}.")
+        _job_log(f"Build started for {len(tokens)} token(s).")
         for i, token in enumerate(tokens):
             if job_state["cancel"]:
                 job_state["status"] = "cancelled"
@@ -177,10 +178,12 @@ def _run_build_job(
                 _prog(j / n_steps, f"Loading {sid}…")
                 region   = regions_t[sid]
                 _pos_key = tuple(region["meta"]["positions"].tolist())
-                region["genotypes"], region["g1_wins"] = load_call_data(
+                (region["genotypes"],
+                 region["g1_wins"],
+                 region["ad_g1"],
+                 region["ad_g2"]) = load_call_data(
                     region["ds"],
                     cache_key=(sid, apply_filter_pass, apply_numalt1, _pos_key),
-                    load_ad=(het_mode in ("major_ad", "ordered_ad")),
                 )
 
             if job_state["cancel"]:
@@ -189,9 +192,40 @@ def _run_build_job(
                 return
 
             _prog(n_r / n_steps, "Building allele matrix…")
-            am = build_allele_matrix(regions_t, excluded_positions, het_mode, het_sep)
+            am, phasing_matrix = build_allele_matrix(regions_t, excluded_positions)
             for r in regions_t.values():
-                r["genotypes"] = r["g1_wins"] = None
+                r["genotypes"] = r["g1_wins"] = r["ad_g1"] = r["ad_g2"] = None
+
+            # ── Build reference row (all REF alleles, virtual sample "_REF") ──────
+            ref_alleles: dict[str, str] = {}
+            for region in regions_t.values():
+                for vi, pos in enumerate(region["meta"]["positions"]):
+                    ps = str(pos)
+                    if ps in am.columns:
+                        ref_alleles[ps] = str(region["meta"]["alleles"][vi][0]).rstrip("-\x00")
+            ref_am = pd.DataFrame(
+                [{c: ref_alleles.get(c, "-") for c in am.columns}],
+                index=["_REF"],
+            )
+
+            # ── Save raw allele matrix to .debug/ ────────────────────────────────
+            debug_dir = ".debug"
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_fname = _token_to_filename(token).replace(".tsv", "__raw_alleles.tsv")
+            debug_fpath = os.path.join(debug_dir, debug_fname)
+            debug_am = pd.concat([ref_am, am])
+            if phasing_matrix is not None:
+                phasing_renamed = phasing_matrix.rename(
+                    columns={c: f"{c}_phasing" for c in phasing_matrix.columns}
+                )
+                phasing_ref_row = pd.DataFrame(
+                    [{f"{c}_phasing": "hom" for c in phasing_matrix.columns}],
+                    index=["_REF"],
+                )
+                debug_am = pd.concat([debug_am, pd.concat([phasing_ref_row, phasing_renamed])], axis=1)
+            debug_am.index.name = "sample_id"
+            debug_am.reset_index().to_csv(debug_fpath, sep="\t", index=False)
+            _job_log(f"[{i+1}/{len(tokens)}] Debug allele matrix saved to {debug_fpath}")
 
             if job_state["cancel"]:
                 job_state["status"] = "cancelled"
@@ -204,19 +238,55 @@ def _run_build_job(
 
             raw_t = compute_haplotypes(
                 deduped_t, regions_t, resolved_t, parsed_t,
-                reference_files["cds_gff"], het_sep=het_sep, mode=format_mode,
+                reference_files["cds_gff"], het_sep=_HET_SEP,
             )
             deduped_t = None
 
             raw_t = raw_t.drop(columns=[c for c in raw_t.columns if str(c).isdigit()])
             for c in [c for c in raw_t.columns if c.endswith("_ns_changes")]:
-                raw_t[c] = raw_t[c].apply(lambda v: _format_ns_changes(v, format_mode))
+                raw_t[c] = raw_t[c].apply(_format_ns_changes)
+
+            # ── Compute REF row haplotypes ────────────────────────────────────────
+            ref_deduped = deduplicate_allele_matrix(ref_am)
+            ref_raw = compute_haplotypes(
+                ref_deduped, regions_t, resolved_t, parsed_t,
+                reference_files["cds_gff"], het_sep=_HET_SEP,
+            )
+            ref_raw = ref_raw.drop(columns=[c for c in ref_raw.columns if str(c).isdigit()])
+            for c in [c for c in ref_raw.columns if c.endswith("_ns_changes")]:
+                ref_raw[c] = ref_raw[c].apply(_format_ns_changes)
+            ref_per_sample = _make_per_sample_df(ref_raw)
+            ref_per_sample["sample_id"] = "_REF"
+
+            # ── Build per-sample output ───────────────────────────────────────────
+            per_sample = pd.concat(
+                [ref_per_sample, _make_per_sample_df(raw_t)],
+                ignore_index=True,
+            )
+            raw_t = ref_raw = ref_deduped = None
+
+            # Attach per-position phasing status columns
+            if phasing_matrix is not None:
+                phasing_out = phasing_matrix.rename(
+                    columns={c: f"{c}_phasing" for c in phasing_matrix.columns}
+                )
+                phasing_out.index.name = "sample_id"
+                # REF row: all "hom"
+                ref_phasing_row = pd.DataFrame(
+                    [{f"{c}_phasing": "hom" for c in phasing_matrix.columns}],
+                    index=["_REF"],
+                )
+                ref_phasing_row.index.name = "sample_id"
+                phasing_out = pd.concat([ref_phasing_row, phasing_out])
+                per_sample = per_sample.merge(
+                    phasing_out.reset_index(), on="sample_id", how="left"
+                )
 
             os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
-            fname = _token_to_filename(token, format_mode)
+            fname = _token_to_filename(token)
             fpath = os.path.join(HAPLOTYPES_DIR, fname)
-            _make_per_sample_df(raw_t).to_csv(fpath, sep="\t", index=False)
-            raw_t = regions_t = None
+            per_sample.to_csv(fpath, sep="\t", index=False)
+            regions_t = None
 
             token_elapsed = time.monotonic() - token_start
             # Set state to done atomically — progress fields are now irrelevant and
@@ -288,12 +358,12 @@ def render():
         with st.expander("Debug"):
             st.write("**Chunk index**")
             st.dataframe(chunk_index_df, width="stretch", hide_index=True)
+            st.write(f"**Tokens ({len(tokens)}):** {tokens}")
             st.write("**Parsed loci (all tokens combined):**")
             st.dataframe(parsed_loci, width="stretch", hide_index=True)
             st.write("**Resolved genomic intervals:**")
             for sid, info in resolved_loci.items():
                 st.text(f"{sid} ({info['coord_type']}): {info['intervals']}")
-            st.write(f"**Tokens ({len(tokens)}):** {tokens}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 1. Variant metadata table (all tokens combined for overview)
@@ -375,66 +445,9 @@ def render():
     st.divider()
     st.subheader("Build haplotypes")
 
-    _FORMAT_DF = pd.DataFrame([
-        {
-            "format strategy": "default",
-            "description": "Show both alleles at het positions with the major allele first",
-            "speed": "slower",
-            "format of mutation position column if het, e.g., PF3D7_XXXXXXX_56": "T,M",
-            "format of '_haplotype' column": "-T,[T/M]GK",
-            "format of '_ns_changes' column": "G42-, K43T, M56[T/M], C58K",
-        }, {
-            "format strategy": "skip",
-            "description": "Skip processing hets and mark as #",
-            "speed": "faster",
-            "format of mutation position column if het, e.g., PF3D7_XXXXXXX_56": "#",
-            "format of '_haplotype' column": "-T,#GK",
-            "format of '_ns_changes' column": "G42-, K43T, M56#, C58K",
-        }, {
-            "format strategy": "collapse",
-            "description": "Collapse het to hom using the major allele",
-            "speed": "slower",
-            "format of mutation position column if het, e.g., PF3D7_XXXXXXX_56": "T",
-            "format of '_haplotype' column": "-T,TGK",
-            "format of '_ns_changes' column": "G42-, K43T, M56T, C58K",
-        }, {
-            "format strategy": "expand",
-            "description": "Expand het positions to two separate ns_changes entries",
-            "speed": "slower",
-            "format of mutation position column if het, e.g., PF3D7_XXXXXXX_56": "T,M",
-            "format of '_haplotype' column": "-T,[T/M]GK",
-            "format of '_ns_changes' column": "G42-, K43T, M56T, M56M, C58K",
-        },
-    ])
-
-    st.caption(
-        "Imagine you queried `PF3D7_XXXXXXX[42-43, 56-58]` and a sample had: "
-        "G42- (missing), K43T, M56[T/M], wild type G57, C58K — "
-        "how would you like the output formatted?"
-    )
-    _fmt_sel = st.dataframe(
-        _FORMAT_DF,
-        key="order_fmt_selection",
-        hide_index=True,
-        width="stretch",
-        on_select="rerun",
-        selection_mode="single-row",
-    )
-    _selected_rows = _fmt_sel.selection.rows
-    if _selected_rows:
-        FORMAT_MODE = _FORMAT_DF.iloc[_selected_rows[0]]["format strategy"]
-        st.session_state["order_fmt_mode"] = FORMAT_MODE
-    else:
-        FORMAT_MODE = st.session_state.get("order_fmt_mode", "default")
-
-    _HET_MODE_MAP = {"default": "ordered_ad", "skip": "exclude",
-                     "collapse": "major_ad",  "expand": "ordered_ad"}
-    HET_MODE = _HET_MODE_MAP[FORMAT_MODE]
-    HET_SEP  = "/"
-
     # ── Settings hash — cancel any running job when inputs change ─────────────
     _settings_hash = hashlib.md5(
-        repr((RAW_USER_INPUT, apply_filter_pass, apply_numalt1, FORMAT_MODE)).encode()
+        repr((RAW_USER_INPUT, apply_filter_pass, apply_numalt1)).encode()
     ).hexdigest()[:16]
 
     if st.session_state.get("order_settings_hash") != _settings_hash:
@@ -449,46 +462,42 @@ def render():
 
     if job_state is None:
         n_tok = len(tokens)
-        if _selected_rows:
-            if st.button(
-                f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})",
-                type="primary",
-            ):
-                new_job: dict = {
-                    "cancel":    False,
-                    "n_tokens":  n_tok,
-                    "status":    "running",
-                    "current_i": None,
-                    "error":     None,
-                    "tokens": {
-                        i: {"state": "pending", "path": None, "warnings": [], "error": None,
-                            "progress": None, "progress_text": None}
-                        for i in range(n_tok)
-                    },
-                }
-                st.session_state["order_job_state"] = new_job
-                worker = threading.Thread(
-                    target=_run_build_job,
-                    args=(
-                        new_job, tokens, reference_files, variant_data,
-                        chunk_index_df, excluded_positions,
-                        HET_MODE, HET_SEP, FORMAT_MODE,
-                        apply_filter_pass, apply_numalt1,
-                    ),
-                    daemon=True,
-                )
+        if st.button(
+            f"Build haplotypes ({n_tok} file{'s' if n_tok != 1 else ''})",
+            type="primary",
+        ):
+            new_job: dict = {
+                "cancel":    False,
+                "n_tokens":  n_tok,
+                "status":    "running",
+                "current_i": None,
+                "error":     None,
+                "tokens": {
+                    i: {"state": "pending", "path": None, "warnings": [], "error": None,
+                        "progress": None, "progress_text": None}
+                    for i in range(n_tok)
+                },
+            }
+            st.session_state["order_job_state"] = new_job
+            worker = threading.Thread(
+                target=_run_build_job,
+                args=(
+                    new_job, tokens, reference_files, variant_data,
+                    chunk_index_df, excluded_positions,
+                    apply_filter_pass, apply_numalt1,
+                ),
+                daemon=True,
+            )
 
-                # If available, bind Streamlit context so cached/data APIs invoked
-                # in the worker thread don't emit ScriptRunContext warnings.
-                if add_script_run_ctx and get_script_run_ctx:
-                    ctx = get_script_run_ctx()
-                    if ctx is not None:
-                        add_script_run_ctx(worker, ctx)
+            # If available, bind Streamlit context so cached/data APIs invoked
+            # in the worker thread don't emit ScriptRunContext warnings.
+            if add_script_run_ctx and get_script_run_ctx:
+                ctx = get_script_run_ctx()
+                if ctx is not None:
+                    add_script_run_ctx(worker, ctx)
 
-                worker.start()
-                st.rerun()
-        else:
-            st.caption("Select a format strategy above to enable building.")
+            worker.start()
+            st.rerun()
         return
 
     # ── Render per-token status (fragment auto-polls the background thread) ─────

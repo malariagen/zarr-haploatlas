@@ -159,8 +159,7 @@ def _aa_slice(alt_aa: str, start: int, end: int, ref_len: int | None = None) -> 
 def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
                        loci_df: pd.DataFrame, cds_gff: pd.DataFrame,
                        ref_fasta_path: str = REF_FASTA,
-                       het_sep: str = "/",
-                       mode: str = "default") -> pd.DataFrame:
+                       het_sep: str = "/") -> pd.DataFrame:
     """
     Compute haplotypes for each unique allele combination in `deduped`.
 
@@ -206,7 +205,17 @@ def compute_haplotypes(deduped: pd.DataFrame, regions: dict, resolved: dict,
         if locus_info["coord_type"] == "aa":
             cols = _add_aa_haplotypes(deduped, source_id, region["meta"],
                                       query_ranges, cds_gff, ref_genome,
-                                      het_sep=het_sep, prefix=prefix, mode=mode)
+                                      het_sep=het_sep, prefix=prefix)
+            # Also preserve nucleotide haplotypes for AA loci
+            nt_cols = _add_nt_haplotypes(
+                deduped, source_id, region["meta"],
+                nt_ranges=None,  # derive column names from genomic intervals
+                intervals=locus_info["intervals"],
+                ref_genome=ref_genome,
+                het_sep=het_sep,
+                prefix=prefix,
+            )
+            cols = {**cols, **nt_cols}
         else:
             cols = _add_nt_haplotypes(deduped, source_id, region["meta"],
                                       query_ranges, locus_info["intervals"], ref_genome,
@@ -267,7 +276,7 @@ _MAX_PER_POS_COLS = 50  # skip individual-position columns for very wide queries
 
 def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                        cds_gff, ref_genome, het_sep: str = "/",
-                       prefix: str | None = None, mode: str = "default") -> dict:
+                       prefix: str | None = None) -> dict:
     cds_result = _build_ref_cds(source_id, cds_gff, ref_genome)
     if cds_result is None:
         return {}
@@ -397,7 +406,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     else:
                         chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
-            elif has_ordered and mode in ("default", "expand"):
+            elif has_ordered:
                 # Build char-by-char: het positions show [major/minor]
                 chars = []
                 for aa_p in range(aa_start, aa_end + 1):
@@ -409,8 +418,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                     else:
                         chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
-            elif has_het or has_ordered or has_multi:
-                # skip/collapse modes: collapse the whole range to "*"
+            elif has_het or has_multi:
                 hap_parts.append(HET_SYMBOL)
             else:
                 hap_parts.append(_aa_slice(alt_aa, aa_start, aa_end, ref_protein_len)
@@ -463,7 +471,7 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             elif is_ordered:
                 aa_m = _aa_at(alt_aa_major, aa_pos, ref_protein_len)
                 aa_n = _aa_at(alt_aa_minor, aa_pos, ref_protein_len)
-                per_pos_lists[col_name].append(f"{aa_m},{aa_n}" if aa_m != aa_n else aa_m)
+                per_pos_lists[col_name].append(f"{aa_m}{het_sep}{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
                               if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
@@ -571,7 +579,7 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
                 alt_minor = _apply_variants(ref_iv, sorted_pos_info, alleles_minor)
                 # haplotype keeps het_sep ("/") to stay unambiguous with the "," interval separator
                 alt_seq_hap = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
-                alt_seq_col = f"{alt_major},{alt_minor}" if alt_major != alt_minor else alt_major
+                alt_seq_col = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
             else:
                 alt_seq_hap = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
                 alt_seq_col = alt_seq_hap

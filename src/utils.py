@@ -2,7 +2,65 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import xarray as xr
+import malariagen_data
 import re
+from scipy.stats import binom as _binom_dist
+
+
+# ── Phasing-safety constants ──────────────────────────────────────────────────
+# Heterozygous genotype calls at a position are classified as "safe to phase"
+# only when all four criteria below are met.  A binomial one-sided test is used
+# to ask: could the minor-allele reads simply be sequencing noise?
+#
+# _P_NOISE — noise baseline for the binomial null hypothesis.
+#   Illumina instruments typically achieve per-base error rates of 0.1–1 %
+#   (Phred Q20–Q30).  Setting p_noise = 0.02 (2 %) is deliberately conservative:
+#   it sits above the empirical error rate, making it harder to reject the null
+#   and therefore reducing false-positive "safe" calls.  Using the true error rate
+#   (~0.5 %) would make the test nearly trivially pass for any minor allele above
+#   a handful of reads; 2 % provides a more robust guard.
+#
+# _ALPHA — significance threshold for the binomial p-value.
+#   A standard α = 0.05 is appropriate for a single test, but this test is
+#   applied independently to every (sample × position) pair in a cohort, which
+#   can run to tens of thousands of comparisons.  Using α = 0.01 provides
+#   informal protection against the multiple-testing burden without requiring
+#   full Bonferroni correction (which would demand α ~ 10⁻⁶ for large datasets
+#   and would be excessively conservative for a per-call quality annotation).
+#
+# _MIN_TOTAL_AD — minimum total allele depth.
+#   Allele-frequency confidence intervals widen rapidly below ~20× coverage.
+#   The 95 % Clopper–Pearson interval for a minor VAF of 20 % at depth 20 is
+#   approximately [0.06, 0.44] — already spanning a fourfold range.  Below 20×,
+#   the binomial p-value can appear significant by chance even when the data are
+#   uninformative (e.g. 3/3 reads at the minority allele).  This floor ensures
+#   the test is only applied where depth is sufficient to meaningfully distinguish
+#   single-strain from multi-strain genotypes.  A threshold of 20× is consistent
+#   with widely adopted variant-calling best practices (e.g. GATK hard filters).
+#
+# _MIN_MINOR_AD — minimum absolute minor-allele read count.
+#   Even at adequate total depth, very few supporting reads for the minor allele
+#   are a red flag: a single miscalled base in an otherwise homozygous region
+#   could yield 1–4 alt reads.  Requiring ≥ 5 minor-allele reads provides an
+#   absolute floor that the binomial p-value alone cannot enforce, particularly
+#   in regions with high reference bias or soft-clipping artefacts.
+#
+# _MAX_MINOR_VAF — maximum minor allele fraction for reliable ordering.
+#   Even a genuine heterozygous call is labelled "unsafe" if the two alleles are
+#   too close in frequency to order reliably.  If the true minor-allele fraction
+#   is p, the probability of observing more minor reads than major reads in a
+#   sample of n reads is P(Binomial(n, p) > n/2).  At p = 0.40 and n = 30 this
+#   ordering-error probability is ~15 %; at p = 0.45 it exceeds 35 %.  A cap of
+#   0.40 therefore requires at least a 60:40 split, keeping the probability of
+#   mis-ordering the alleles below ~15 % even at the minimum eligible depth,
+#   and well below 5 % at ≥ 50× coverage.  Calls above this threshold are still
+#   reported as het (the call itself is valid) but the major/minor labelling
+#   should not be used for haplotype inference.
+_P_NOISE      = 0.02   # conservative noise baseline (above typical Illumina Q20–Q30 error rate)
+_ALPHA        = 0.01   # per-test threshold; guards against multiple-testing inflation
+_MIN_TOTAL_AD = 20     # depth floor; below this, allele-frequency CIs are too wide
+_MIN_MINOR_AD = 5      # absolute read floor; prevents artefactual single-base miscalls
+_MAX_MINOR_VAF = 0.40  # ordering reliability cap; >40% minor VAF → major/minor assignment unreliable
 
 
 # ── Reference data ────────────────────────────────────────────────────────────
@@ -33,56 +91,11 @@ def load_reference_files() -> dict:
     }
 
 
-def _open_variant_calls():
-    """Open the Pf9 variant calls zarr store directly via gcsfs + zarr.
-
-    Uses zarr.open_consolidated (same as malariagen_data internally) to avoid
-    an xarray/zarr version incompatibility in xr.open_zarr. Uses the logged-in
-    user's OAuth access token on Streamlit Cloud, ADC locally.
-    """
-    import gcsfs
-    import zarr
-    import dask.array as da
-
-    if "gcp_service_account" in st.secrets:
-        import google.oauth2.service_account as sa
-        token = sa.Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"],
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-    else:
-        token = None  # local dev: gcsfs will use ADC
-
-    fs = gcsfs.GCSFileSystem(token=token)
-    store = fs.get_mapper("pf9-release/zarr/")
-    root = zarr.open_consolidated(store=store)
-
-    ref = da.from_zarr(root["variants/REF"])
-    alt = da.from_zarr(root["variants/ALT"])
-
-    return xr.Dataset(
-        data_vars={
-            "variant_allele":      (["variants", "alleles"],              da.concatenate([ref[:, None], alt], axis=1)),
-            "variant_is_snp":      (["variants"],                         da.from_zarr(root["variants/is_snp"])),
-            "variant_filter_pass": (["variants"],                         da.from_zarr(root["variants/FILTER_PASS"])),
-            "variant_CDS":         (["variants"],                         da.from_zarr(root["variants/CDS"])),
-            "variant_numalt":      (["variants"],                         da.from_zarr(root["variants/numalt"])),
-            "call_genotype":       (["variants", "samples", "ploidy"],    da.from_zarr(root["calldata/GT"])),
-            "call_AD":             (["variants", "samples", "alleles"],   da.from_zarr(root["calldata/AD"])),
-        },
-        coords={
-            "variant_position": (["variants"], da.from_zarr(root["variants/POS"])),
-            "variant_chrom":    (["variants"], da.from_zarr(root["variants/CHROM"])),
-            "sample_id":        (["samples"],  da.from_zarr(root["samples"])),
-        }
-    )
-
-
 @st.cache_resource(show_spinner="Connecting to variant data…")
 def load_variant_data():
     # cache_resource keeps a single reference; cache_data would pickle the entire
     # zarr-backed Dataset into a copy, consuming several hundred MB unnecessarily.
-    return _open_variant_calls()
+    return malariagen_data.Pf9().variant_calls()
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
@@ -96,7 +109,7 @@ def build_chunk_index() -> pd.DataFrame:
     if os.path.exists(_CHUNK_INDEX_PATH):
         return pd.read_csv(_CHUNK_INDEX_PATH)
 
-    variant_data = _open_variant_calls()
+    variant_data = malariagen_data.Pf9().variant_calls()
 
     pos_var    = variant_data["variant_position"]
     chrom_var  = variant_data["variant_chrom"]
@@ -469,10 +482,57 @@ def build_variant_rows(source_id: str, meta: dict, locus_info: dict) -> list[dic
     return rows
 
 
-@st.cache_data
-def load_call_data(_ds: xr.Dataset, cache_key: tuple, load_ad: bool = True) -> tuple[np.ndarray, np.ndarray | None]:
+def _compute_phasing_status(
+    het: np.ndarray,
+    missing: np.ndarray,
+    ad_g1_vi: np.ndarray,
+    ad_g2_vi: np.ndarray,
+    g1_wins_vi: np.ndarray,
+) -> np.ndarray:
+    """Per-sample phasing status for one variant position.
+
+    Returns a 1-D object array (n_samples) with one of:
+        "-"          missing genotype
+        "hom"        homozygous call
+        "het:safe"   het; minor allele significantly above noise (binomial p < _ALPHA)
+        "het:unsafe" het; minor allele may be noise
+
+    The binomial test is one-sided (H0: minor-allele rate == _P_NOISE) and is
+    applied vectorised over all het samples at once.
     """
-    Load genotypes and, if requested, a precomputed allele-depth comparison.
+    n = len(het)
+    result = np.full(n, "hom", dtype=object)
+    result[missing] = "-"
+
+    if not het.any():
+        return result
+
+    total_ad = ad_g1_vi + ad_g2_vi
+    minor_ad = np.where(g1_wins_vi, ad_g2_vi, ad_g1_vi)  # g1_wins → g1 is major
+
+    het_total = total_ad[het]
+    het_minor = minor_ad[het]
+
+    # P(X >= k | n, p_noise) = binom.sf(k-1, n, p_noise)  (one-sided greater)
+    pvals = _binom_dist.sf(het_minor - 1, het_total, _P_NOISE)
+
+    safe = (
+        (het_total >= _MIN_TOTAL_AD) &
+        (het_minor >= _MIN_MINOR_AD) &
+        (pvals < _ALPHA) &
+        (het_minor / het_total <= _MAX_MINOR_VAF)
+    )
+
+    result[het] = np.where(safe, "het:safe", "het:unsafe")
+    return result
+
+
+@st.cache_data
+def load_call_data(
+    _ds: xr.Dataset, cache_key: tuple,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load genotypes and allele-depth data.
 
     Args:
         _ds:       xr.Dataset for the region. Prefixed with _ so Streamlit excludes it
@@ -480,19 +540,15 @@ def load_call_data(_ds: xr.Dataset, cache_key: tuple, load_ad: bool = True) -> t
         cache_key: stable hashable key that uniquely identifies this dataset —
                    pass (source_id, apply_filter_pass, apply_numalt1) from the caller.
                    Must change whenever _ds changes.
-        load_ad:   set to False to skip AD entirely (e.g. when het_mode="exclude").
-                   Halves the data downloaded from GCS.
 
     Returns:
         genotypes: (n_variants, n_samples, 2) int8
-        g1_wins:   (n_variants, n_samples) bool — True where the first called allele
-                   has >= depth than the second. None if load_ad=False.
+        g1_wins:   (n_variants, n_samples) bool — True where first called allele has
+                   >= depth than the second.
+        ad_g1:     (n_variants, n_samples) int — AD for the first called allele index.
+        ad_g2:     (n_variants, n_samples) int — AD for the second called allele index.
     """
     genotypes = _ds["call_genotype"].values.astype(np.int8)
-
-    if not load_ad:
-        return genotypes, None
-
     ad = _ds["call_AD"].values  # (n_variants, n_samples, n_alleles)
 
     n_v, n_s   = genotypes.shape[:2]
@@ -502,35 +558,42 @@ def load_call_data(_ds: xr.Dataset, cache_key: tuple, load_ad: bool = True) -> t
     g1 = np.minimum(genotypes[:, :, 0].clip(0), n_alleles - 1)
     g2 = np.minimum(genotypes[:, :, 1].clip(0), n_alleles - 1)
 
-    g1_wins = ad[vi, si, g1] >= ad[vi, si, g2]  # (n_variants, n_samples) bool
-    return genotypes, g1_wins
+    ad_g1   = ad[vi, si, g1]          # (n_variants, n_samples)
+    ad_g2   = ad[vi, si, g2]
+    g1_wins = ad_g1 >= ad_g2          # (n_variants, n_samples) bool
+    return genotypes, g1_wins, ad_g1, ad_g2
 
 
 def build_allele_matrix(
     regions: dict,
     excluded_positions: set[str] | None = None,
-    het_mode: str = "exclude",
-    het_sep: str = "/",
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Build a samples × positions DataFrame of called alleles.
+    Build a samples × positions DataFrame of called alleles, plus a parallel
+    phasing-status DataFrame.
 
-    het_mode:
-      "exclude"  – het → "#", missing → "-"
-      "major_ad" – resolve het to the allele with higher depth (requires g1_wins)
+    Het calls are encoded as "major/minor" ordered by allele depth.
+    Missing calls are encoded as "-".
 
     excluded_positions: set of position strings to omit entirely.
+
+    Returns:
+        allele_matrix:  (n_samples × n_positions) DataFrame of called allele strings
+        phasing_matrix: same shape; values "hom" / "het:safe" / "het:unsafe" / "-".
     """
     excluded_positions = excluded_positions or set()
     col_labels: list[str] = []
     col_arrays: list      = []
+    phasing_arrays: list  = []
     seen_positions: set[str] = set()
     sample_ids = None
 
     for region in regions.values():
-        meta     = region["meta"]
+        meta      = region["meta"]
         genotypes = region["genotypes"]   # (n_variants, n_samples, 2)
-        g1_wins   = region.get("g1_wins") # (n_variants, n_samples) bool, or None
+        g1_wins   = region["g1_wins"]     # (n_variants, n_samples) bool
+        ad_g1     = region["ad_g1"]       # (n_variants, n_samples) int
+        ad_g2     = region["ad_g2"]       # (n_variants, n_samples) int
         positions = meta["positions"]
 
         if sample_ids is None:
@@ -555,28 +618,23 @@ def build_allele_matrix(
             missing = (gt1 < 0) | (gt2 < 0)
             het     = ~missing & (a1 != a2)
 
-            if het_mode == "major_ad" and g1_wins is not None:
-                calls = np.where(missing, "-", np.where(het, np.where(g1_wins[vi], a1, a2), a1))
-            elif het_mode == "ordered_ad" and g1_wins is not None:
-                # "major/minor" ordered by allele depth
-                major   = np.where(g1_wins[vi], a1, a2)
-                minor   = np.where(g1_wins[vi], a2, a1)
-                ordered = np.array([f"{m}{het_sep}{n}" for m, n in zip(major, minor)], dtype=object)
-                calls   = np.where(missing, "-", np.where(het, ordered, a1))
-            else:
-                calls = np.where(missing, "-", np.where(het, "#", a1))
+            major   = np.where(g1_wins[vi], a1, a2)
+            minor   = np.where(g1_wins[vi], a2, a1)
+            ordered = np.array([f"{m}/{n}" for m, n in zip(major, minor)], dtype=object)
+            calls   = np.where(missing, "-", np.where(het, ordered, a1))
 
             seen_positions.add(label)
             col_labels.append(label)
             col_arrays.append(np.asarray(calls, dtype=object))
+            phasing_arrays.append(
+                _compute_phasing_status(het, missing, ad_g1[vi], ad_g2[vi], g1_wins[vi])
+            )
 
+    empty_idx = sample_ids if sample_ids is not None else []
     if not col_arrays:
-        return pd.DataFrame(
-            np.empty((len(sample_ids), 0), dtype=object),
-            index=sample_ids, columns=[],
-        )
-    return pd.DataFrame(
-        np.column_stack(col_arrays),
-        index=sample_ids,
-        columns=col_labels,
-    )
+        empty = pd.DataFrame(np.empty((len(empty_idx), 0), dtype=object), index=empty_idx, columns=[])
+        return empty, empty.copy()
+
+    allele_matrix  = pd.DataFrame(np.column_stack(col_arrays),   index=sample_ids, columns=col_labels)
+    phasing_matrix = pd.DataFrame(np.column_stack(phasing_arrays), index=sample_ids, columns=col_labels)
+    return allele_matrix, phasing_matrix
