@@ -520,7 +520,7 @@ def _compute_phasing_status(
         (het_total >= _MIN_TOTAL_AD) &
         (het_minor >= _MIN_MINOR_AD) &
         (pvals < _ALPHA) &
-        (het_minor / het_total <= _MAX_MINOR_VAF)
+        (het_minor / np.maximum(het_total, 1) <= _MAX_MINOR_VAF)
     )
 
     result[het] = np.where(safe, "het:safe", "het:unsafe")
