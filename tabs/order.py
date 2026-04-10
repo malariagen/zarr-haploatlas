@@ -80,13 +80,14 @@ def _token_to_filename(token: str) -> str:
     return f"{gene_label}_{pos_summary}__{coord_type}__{ts}.tsv"
 
 
-_NS_HET_RE = re.compile(r'^([A-Za-z?])(\d+)([A-Za-z*\-])\/([A-Za-z*\-])$')
+_NS_HET_RE = re.compile(r'^([A-Za-z?!>])(\d+)([A-Za-z*\-!>])([/|])([A-Za-z*\-!>])$')
 
 
 def _format_ns_changes(val) -> str:
     """Format a raw ns_changes list into a human-readable string.
 
     Het entries stored as 'K76I/K' are rendered as 'K76[I/K]'.
+    Unsafe het entries with '|' separator render as 'K76[I|K]'.
     """
     if isinstance(val, list):
         changes = val
@@ -103,7 +104,7 @@ def _format_ns_changes(val) -> str:
     for entry in changes:
         m = _NS_HET_RE.match(entry)
         if m:
-            parts.append(f"{m.group(1)}{m.group(2)}[{m.group(3)}/{m.group(4)}]")
+            parts.append(f"{m.group(1)}{m.group(2)}[{m.group(3)}{m.group(4)}{m.group(5)}]")
         else:
             parts.append(entry)
     return ", ".join(parts)
@@ -191,7 +192,7 @@ def _run_build_job(
                 return
 
             _prog(0.7, "Deduplicating…")
-            deduped_t, phasing_matrix = build_allele_matrix(
+            deduped_t = build_allele_matrix(
                 regions_t,
                 excluded_positions,
                 progress_cb=lambda p, t: _prog(0.7 + p * 0.2, t),
@@ -261,23 +262,6 @@ def _run_build_job(
                 ignore_index=True,
             )
             raw_t = ref_raw = ref_deduped = None
-
-            # Attach per-position phasing status columns
-            if phasing_matrix is not None:
-                phasing_out = phasing_matrix.rename(
-                    columns={c: f"{c}_phasing" for c in phasing_matrix.columns}
-                )
-                phasing_out.index.name = "sample_id"
-                # REF row: all "hom"
-                ref_phasing_row = pd.DataFrame(
-                    [{f"{c}_phasing": "hom" for c in phasing_matrix.columns}],
-                    index=["_REF"],
-                )
-                ref_phasing_row.index.name = "sample_id"
-                phasing_out = pd.concat([ref_phasing_row, phasing_out])
-                per_sample = per_sample.merge(
-                    phasing_out.reset_index(), on="sample_id", how="left"
-                )
 
             os.makedirs(HAPLOTYPES_DIR, exist_ok=True)
             fname = _token_to_filename(token)

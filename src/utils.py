@@ -572,9 +572,9 @@ def build_allele_matrix(
     regions: dict,
     excluded_positions: set[str] | None = None,
     progress_cb=None,
-) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+) -> pd.DataFrame:
     """
-    Build a deduplicated allele table and a per-sample phasing-status DataFrame.
+    Build a deduplicated allele table.
 
     Data must already be loaded into ``region["genotypes"]`` etc. (via
     ``load_call_data``).  Samples are processed in Python chunks of
@@ -584,8 +584,10 @@ def build_allele_matrix(
     (position columns + ``n_samples`` + ``sample_ids``), with no separate
     deduplication pass required.
 
-    Het calls are encoded as "major/minor" ordered by allele depth.
-    Missing calls are encoded as "-".
+    Het calls encode phasing confidence in the separator:
+      - ``"major/minor"``  safe het  (minor allele significantly above noise)
+      - ``"major|minor"``  unsafe het (low depth or VAF too close to 0.5)
+    Missing calls are encoded as ``"-"``.
 
     Args:
         regions:            dict mapping source_id → region dict with pre-loaded
@@ -595,12 +597,8 @@ def build_allele_matrix(
                             after each sample chunk (~540 calls for 53 k samples).
 
     Returns:
-        deduped:        DataFrame — one row per unique allele combination, with
-                        position columns plus ``n_samples`` (int) and
-                        ``sample_ids`` (list[str]).
-        phasing_matrix: (n_samples × n_positions) DataFrame indexed by sample_id,
-                        values "hom" / "het:safe" / "het:unsafe" / "-"; or None
-                        when there are no position columns.
+        DataFrame — one row per unique allele combination, with position columns
+        plus ``n_samples`` (int) and ``sample_ids`` (list[str]).
     """
     excluded_positions = excluded_positions or set()
 
@@ -612,8 +610,7 @@ def build_allele_matrix(
     sample_ids = None
 
     # per-column arrays accumulated once across all regions
-    call_arrays:    list[np.ndarray] = []   # each (n_samples,) object
-    phasing_arrays: list[np.ndarray] = []   # each (n_samples,) object
+    call_arrays: list[np.ndarray] = []   # each (n_samples,) object
 
     for region in regions.values():
         meta      = region["meta"]
@@ -648,29 +645,47 @@ def build_allele_matrix(
             g1w     = g1_wins[vi]
             major   = np.where(g1w, a1, a2)
             minor   = np.where(g1w, a2, a1)
-            ordered = np.array([f"{m}/{n}" for m, n in zip(major, minor)], dtype=object)
+            # Phasing confidence is encoded in the allele separator rather than a separate column.
+            # This keeps the information co-located with the call and avoids wide per-position
+            # phasing columns in the output TSV.
+            #
+            # Separator convention:
+            #   "major/minor"  safe het  — minor allele passes binomial test (p < _ALPHA),
+            #                              depth ≥ _MIN_TOTAL_AD, minor reads ≥ _MIN_MINOR_AD,
+            #                              and minor VAF ≤ _MAX_MINOR_VAF.  Major/minor ordering
+            #                              by AD is reliable.
+            #   "major|minor"  unsafe het — fails at least one criterion above.  The call itself
+            #                              is still het; major/minor ordering may be unreliable.
+            #
+            # Both are handled symmetrically downstream (split on "/" or "|"); the separator
+            # is preserved through _add_aa_haplotypes / _add_nt_haplotypes into ns_changes
+            # notation (e.g. "K76[I/K]" vs "K76[I|K]").
+            #
+            # "|" was chosen over other options because:
+            #   - GATK uses "|" for phased GTs in VCF (0|1), but that is in integer allele
+            #     index space.  In amino-acid / nucleotide string space the ambiguity is absent.
+            #   - "/" is already the natural "or" separator for safe ordered hets.
+            #   - "*" and "!" are reserved for spanning deletions and stop codons respectively.
+            phasing_status = _compute_phasing_status(het, missing, ad_g1[vi], ad_g2[vi], g1w)
+            seps    = np.where(phasing_status == "het:safe", "/", "|")
+            ordered = np.array([f"{m}{s}{n}" for m, s, n in zip(major, seps, minor)], dtype=object)
             calls   = np.where(missing, "-", np.where(het, ordered, a1))
 
             seen_positions.add(label)
             col_labels.append(label)
             call_arrays.append(np.asarray(calls, dtype=object))
-            phasing_arrays.append(
-                _compute_phasing_status(het, missing, ad_g1[vi], ad_g2[vi], g1w)
-            )
 
     n_positions = len(col_labels)
 
     if n_positions == 0 or sample_ids is None:
-        return pd.DataFrame(columns=["n_samples", "sample_ids"]), None
+        return pd.DataFrame(columns=["n_samples", "sample_ids"])
 
     n_samples = len(sample_ids)
     # Stack: (n_positions, n_samples) — column-major so row-slicing is a simple index
-    calls_matrix   = np.stack(call_arrays,   axis=0)   # (n_pos, n_samples)
-    phasing_matrix_np = np.stack(phasing_arrays, axis=0)  # (n_pos, n_samples)
+    calls_matrix = np.stack(call_arrays, axis=0)   # (n_pos, n_samples)
 
     # ── Phase 2: iterate over sample chunks, fold into dedup dict ─────────────
     dedup: dict[tuple, dict] = {}
-    phasing_chunks: list[pd.DataFrame] = []
     n_chunks = (n_samples + _SAMPLE_CHUNK_SIZE - 1) // _SAMPLE_CHUNK_SIZE
 
     for chunk_i in range(n_chunks):
@@ -679,8 +694,7 @@ def build_allele_matrix(
         chunk_ids   = sample_ids[chunk_start:chunk_end]
 
         # Slice already-loaded arrays — no I/O
-        chunk_calls   = calls_matrix[:, chunk_start:chunk_end]    # (n_pos, chunk_size)
-        chunk_phasing = phasing_matrix_np[:, chunk_start:chunk_end]
+        chunk_calls = calls_matrix[:, chunk_start:chunk_end]    # (n_pos, chunk_size)
 
         chunk_size = chunk_end - chunk_start
         for s in range(chunk_size):
@@ -691,28 +705,17 @@ def build_allele_matrix(
             else:
                 dedup[key] = {"n": 1, "ids": [str(chunk_ids[s])]}
 
-        phasing_chunks.append(
-            pd.DataFrame(chunk_phasing.T, index=chunk_ids, columns=col_labels)
-        )
-
         if progress_cb is not None:
             progress_cb(
                 (chunk_i + 1) / n_chunks,
                 f"Deduplicating samples {chunk_end:,} / {n_samples:,}…",
             )
 
-    # ── Phase 3: assemble outputs ─────────────────────────────────────────────
+    # ── Phase 3: assemble output ──────────────────────────────────────────────
     rows = [
         {**dict(zip(col_labels, key)), "n_samples": info["n"], "sample_ids": info["ids"]}
         for key, info in dedup.items()
     ]
-    deduped = pd.DataFrame(rows) if rows else pd.DataFrame(
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=col_labels + ["n_samples", "sample_ids"]
     )
-
-    phasing_out: pd.DataFrame | None = None
-    if phasing_chunks:
-        phasing_out = pd.concat(phasing_chunks)
-        phasing_out.index.name = "sample_id"
-
-    return deduped, phasing_out

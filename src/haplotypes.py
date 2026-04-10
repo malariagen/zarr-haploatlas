@@ -73,8 +73,18 @@ def _genomic_to_cds_offset(genomic_pos: int, exons_sorted: pd.DataFrame,
 
 
 def _translate(cds_seq: str, strand: str) -> str:
+    # Symbol convention:
+    #   ">"  frameshift   — CDS length not divisible by 3 after indel application.
+    #                       The reading frame is broken; no meaningful AA sequence exists.
+    #                       ">" is used (not "!") because "!" is reserved for in-frame stops,
+    #                       and visually ">" suggests "shifted beyond".
+    #   "!"  premature stop — in-frame stop codon introduced before the expected end;
+    #                         to_stop=True means Biopython truncates at the stop, so the
+    #                         returned string is shorter than the reference protein.
+    #                         Positions beyond the truncated string return "!" via _aa_at.
+    #   "*"  is intentionally avoided — it is the VCF spanning-deletion allele symbol.
     if len(cds_seq) % 3 != 0:
-        return "!"
+        return ">"
     seq = Seq(cds_seq)
     if strand == "-":
         seq = seq.reverse_complement()
@@ -99,9 +109,10 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
         observed = alleles_here.get(pos_str, info["ref"])
         ref_a    = info["ref"]
 
-        # Multi-allele cells ("G,T") and ordered-ad pairs ("G/T") → treat as reference;
-        # the callers that need both translations handle them before calling this function.
-        if isinstance(observed, str) and ("," in observed or "/" in observed):
+        # Multi-allele cells ("G,T"), safe-het pairs ("G/T"), and unsafe-het pairs ("G|T")
+        # are treated as reference; the callers that need both translations handle them
+        # before calling this function.
+        if isinstance(observed, str) and ("," in observed or "/" in observed or "|" in observed):
             continue
 
         # Strip trailing '-'/null padding; leave special markers untouched
@@ -126,17 +137,20 @@ def _apply_variants(ref_seq: str, sorted_pos_info: list[tuple],
 def _aa_at(alt_aa: str, pos: int, ref_len: int | None = None) -> str:
     """Return amino acid at 1-based position.
 
-    Returns '!' for:
-      - premature stop / frameshift (alt_aa shorter than expected)
-      - the gene's own stop codon position (pos == ref_len + 1, alt full-length)
-      - stop-lost ref side (ref_len given, pos == ref_len + 1)
+    Returns:
+      '>'  when alt_aa == '>' (frameshift — non-in-frame indel)
+      '!'  when pos is beyond the translated sequence (premature in-frame stop, or
+           gene stop codon position when pos == ref_len + 1)
+      '!'  when pos < 1
 
-    '!' is the stop/termination token throughout; '*' is reserved for spanning deletions.
-    If ref_len is given, position ref_len + 1 always returns '!' regardless of alt length
-    (distinguishing "gene stop" from "premature stop" is left to the caller via ref_a).
+    '>' = frameshift (CDS length not divisible by 3 after indel application).
+    '!' = premature stop codon (in-frame stop introduced before expected end).
+    '*' is reserved for VCF spanning deletions and never appears in AA output.
     """
     if pos < 1:
         return "!"
+    if alt_aa == ">":
+        return ">"   # frameshift — every position in this allele is shifted
     if pos <= len(alt_aa):
         return alt_aa[pos - 1]
     return "!"
@@ -145,12 +159,15 @@ def _aa_at(alt_aa: str, pos: int, ref_len: int | None = None) -> str:
 def _aa_slice(alt_aa: str, start: int, end: int, ref_len: int | None = None) -> str:
     """Return AA substring for 1-based inclusive [start, end].
 
-    Positions beyond alt_aa render as '!'. The result is returned as-is; any '!'
-    in the string indicates truncation (premature stop, frameshift, or gene stop codon).
+    When alt_aa == '>' (frameshift) the whole slice renders as '>'.
+    Positions beyond alt_aa render as '!'. The result is returned as-is; any '>'
+    indicates frameshift, any '!' indicates premature stop or gene stop codon.
     ref_len is accepted for API symmetry with _aa_at but has no effect here.
     """
     if start < 1:
         return "!"
+    if alt_aa == ">":
+        return ">"
     return "".join(_aa_at(alt_aa, pos) for pos in range(start, end + 1))
 
 
@@ -252,6 +269,7 @@ def _clip_alleles_at_exon_boundaries(alleles: dict, pos_info: dict) -> dict:
             and allele not in ("*", "#", "-")
             and "," not in allele
             and "/" not in allele
+            and "|" not in allele
             and len(allele) > clip
         ):
             allele = allele[:clip]
@@ -362,14 +380,22 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
     for _, row in deduped.iterrows():
         alleles_here = {p: row[p] for p in pos_info if p in deduped.columns}
 
-        # ordered_ad positions hold "major{sep}minor" nucleotide pairs — pre-compute
-        # separate major/minor translations so per-position columns can show "S/A".
-        ordered_pos = {p for p, v in alleles_here.items()
-                       if isinstance(v, str) and het_sep in v}
+        # het_pos_sep maps position → the separator used in its allele ("/" or "|").
+        # "/" = safe het (phased with confidence), "|" = unsafe het (low-depth / VAF too high).
+        # Both are handled identically for translation; the separator is preserved in output.
+        het_pos_sep: dict[str, str] = {}
+        for p, v in alleles_here.items():
+            if isinstance(v, str):
+                if "/" in v:
+                    het_pos_sep[p] = "/"
+                elif "|" in v:
+                    het_pos_sep[p] = "|"
+
+        ordered_pos = set(het_pos_sep)
         if ordered_pos:
-            alleles_major = {p: v.split(het_sep)[0] if p in ordered_pos else v
+            alleles_major = {p: v.split(het_pos_sep[p])[0] if p in het_pos_sep else v
                              for p, v in alleles_here.items()}
-            alleles_minor = {p: v.split(het_sep)[1] if p in ordered_pos else v
+            alleles_minor = {p: v.split(het_pos_sep[p])[1] if p in het_pos_sep else v
                              for p, v in alleles_here.items()}
             alt_aa_major = _translate(_apply_variants(ref_cds, sorted_pos_info,
                 _clip_alleles_at_exon_boundaries(alleles_major, pos_info)), strand)
@@ -407,14 +433,16 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                         chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
             elif has_ordered:
-                # Build char-by-char: het positions show [major/minor]
+                # Build char-by-char: het positions show [major/minor] or [major|minor]
                 chars = []
                 for aa_p in range(aa_start, aa_end + 1):
                     cvars = aa_to_pos.get(aa_p, [])
                     if any(p in ordered_pos for p in cvars):
                         aa_m = _aa_at(alt_aa_major, aa_p, ref_protein_len)
                         aa_n = _aa_at(alt_aa_minor, aa_p, ref_protein_len)
-                        chars.append(f"[{aa_m}/{aa_n}]" if aa_m != aa_n else aa_m)
+                        codon_seps = {het_pos_sep.get(p) for p in cvars} - {None}
+                        out_sep = "|" if "|" in codon_seps else "/"
+                        chars.append(f"[{aa_m}{out_sep}{aa_n}]" if aa_m != aa_n else aa_m)
                     else:
                         chars.append(_aa_at(alt_aa, aa_p, ref_protein_len))
                 hap_parts.append("".join(chars))
@@ -449,7 +477,9 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
                         if aa_m != ref_a:
                             ns_list.append(f"{ref_a}{aa_pos}{aa_m}")
                     else:
-                        ns_list.append(f"{ref_a}{aa_pos}{aa_m}{het_sep}{aa_n}")
+                        codon_seps = {het_pos_sep.get(p) for p in codon_vars} - {None}
+                        out_sep = "|" if "|" in codon_seps else "/"
+                        ns_list.append(f"{ref_a}{aa_pos}{aa_m}{out_sep}{aa_n}")
                 elif ref_a != alt_a:
                     ns_list.append(f"{ref_a}{aa_pos}{alt_a}")
 
@@ -471,7 +501,9 @@ def _add_aa_haplotypes(deduped, source_id, meta, aa_ranges,
             elif is_ordered:
                 aa_m = _aa_at(alt_aa_major, aa_pos, ref_protein_len)
                 aa_n = _aa_at(alt_aa_minor, aa_pos, ref_protein_len)
-                per_pos_lists[col_name].append(f"{aa_m}{het_sep}{aa_n}" if aa_m != aa_n else aa_m)
+                codon_seps = {het_pos_sep.get(p) for p in codon_vars} - {None}
+                out_sep = "|" if "|" in codon_seps else "/"
+                per_pos_lists[col_name].append(f"{aa_m}{out_sep}{aa_n}" if aa_m != aa_n else aa_m)
             elif has_multi:
                 multi_vars = {p: v for p in codon_vars
                               if isinstance((v := alleles_here.get(p, "")), str) and "," in v}
@@ -558,13 +590,19 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
                 per_iv_lists[cn].append("-")
             continue
 
-        # ordered_ad positions hold "major{sep}minor" nucleotide pairs
-        ordered_pos = {p for p, v in alleles_here.items()
-                       if isinstance(v, str) and het_sep in v}
+        # het_pos_sep maps position → separator ("/" safe or "|" unsafe)
+        het_pos_sep: dict[str, str] = {}
+        for p, v in alleles_here.items():
+            if isinstance(v, str):
+                if "/" in v:
+                    het_pos_sep[p] = "/"
+                elif "|" in v:
+                    het_pos_sep[p] = "|"
+        ordered_pos = set(het_pos_sep)
         if ordered_pos:
-            alleles_major = {p: v.split(het_sep)[0] if p in ordered_pos else v
+            alleles_major = {p: v.split(het_pos_sep[p])[0] if p in het_pos_sep else v
                              for p, v in alleles_here.items()}
-            alleles_minor = {p: v.split(het_sep)[1] if p in ordered_pos else v
+            alleles_minor = {p: v.split(het_pos_sep[p])[1] if p in het_pos_sep else v
                              for p, v in alleles_here.items()}
 
         parts = []
@@ -577,9 +615,11 @@ def _add_nt_haplotypes(deduped, source_id, meta, nt_ranges,
             if iv_ordered:
                 alt_major = _apply_variants(ref_iv, sorted_pos_info, alleles_major)
                 alt_minor = _apply_variants(ref_iv, sorted_pos_info, alleles_minor)
-                # haplotype keeps het_sep ("/") to stay unambiguous with the "," interval separator
-                alt_seq_hap = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
-                alt_seq_col = f"{alt_major}{het_sep}{alt_minor}" if alt_major != alt_minor else alt_major
+                # Use "|" if any position in this interval is an unsafe het
+                iv_seps = {het_pos_sep[p] for p in iv_ordered}
+                out_sep = "|" if "|" in iv_seps else "/"
+                alt_seq_hap = f"{alt_major}{out_sep}{alt_minor}" if alt_major != alt_minor else alt_major
+                alt_seq_col = f"{alt_major}{out_sep}{alt_minor}" if alt_major != alt_minor else alt_major
             else:
                 alt_seq_hap = _apply_variants(ref_iv, sorted_pos_info, alleles_here)
                 alt_seq_col = alt_seq_hap

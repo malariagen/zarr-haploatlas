@@ -82,8 +82,13 @@ class TestApplyVariantsMarkers:
         assert result == "TACG"
 
     def test_ordered_het_slash_skipped(self):
-        """Ordered-ad allele 'A/T' is skipped in the main pass (major/minor handled upstream)."""
+        """Safe-het allele 'A/T' is skipped in the main pass (major/minor handled upstream)."""
         result = _apply_variants("TACG", [("100", _pi(1, "A"))], {"100": "A/T"})
+        assert result == "TACG"
+
+    def test_ordered_het_pipe_skipped(self):
+        """Unsafe-het allele 'A|T' is also skipped in the main pass."""
+        result = _apply_variants("TACG", [("100", _pi(1, "A"))], {"100": "A|T"})
         assert result == "TACG"
 
     def test_trailing_null_stripped_observed(self):
@@ -241,7 +246,7 @@ class TestApplyVariantsHetIndels:
         assert len(minor_cds) % 3 != 0
 
         assert _translate(major_cds, "+") == "MEC"
-        assert _translate(minor_cds, "+") == "!"
+        assert _translate(minor_cds, "+") == ">"   # frameshift
 
     def test_het_minor_deletion_with_downstream_snp(self):
         """
@@ -260,7 +265,7 @@ class TestApplyVariantsHetIndels:
         minor_alleles = {"103": "G", "106": "A"}
         minor_cds = _apply_variants(self.REF_CDS, pi, minor_alleles)
         assert minor_cds == "ATGGAGC"   # 7 nt, frameshift
-        assert _translate(minor_cds, "+") == "!"
+        assert _translate(minor_cds, "+") == ">"   # frameshift
 
     def test_het_minor_insertion_adds_codon(self):
         """
@@ -315,12 +320,13 @@ class TestTranslate:
     def test_plus_strand_basic(self):
         assert _translate("ATGATG", "+") == "MM"
 
-    def test_frameshift_returns_exclamation(self):
-        assert _translate("ATGAT", "+") == "!"     # 5 nt, not divisible by 3
-        assert _translate("AT", "+") == "!"         # 2 nt
+    def test_frameshift_returns_gt(self):
+        # Non-in-frame indel → frameshift → ">" (not "!")
+        assert _translate("ATGAT", "+") == ">"     # 5 nt, not divisible by 3
+        assert _translate("AT", "+") == ">"         # 2 nt
 
     def test_premature_stop_truncates(self):
-        # ATG = M, TAA = stop → "M" (to_stop=True)
+        # ATG = M, TAA = stop → "M" (to_stop=True); premature stop ≠ frameshift
         assert _translate("ATGTAATTT", "+") == "M"
 
     def test_minus_strand_reverse_complement(self):
@@ -344,6 +350,7 @@ class TestAaAt:
         assert _aa_at("MVK", 3) == "K"
 
     def test_beyond_length_is_exclamation(self):
+        # Premature stop: position beyond translated sequence → "!"
         assert _aa_at("MVK", 4) == "!"
 
     def test_zero_is_exclamation(self):
@@ -351,6 +358,15 @@ class TestAaAt:
 
     def test_negative_is_exclamation(self):
         assert _aa_at("MVK", -1) == "!"
+
+    def test_frameshift_gt_returns_gt(self):
+        # When _translate returned ">" (frameshift), every aa position returns ">"
+        assert _aa_at(">", 1) == ">"
+        assert _aa_at(">", 99) == ">"
+
+    def test_frameshift_gt_zero_is_exclamation(self):
+        # pos < 1 always returns "!" regardless of alt_aa
+        assert _aa_at(">", 0) == "!"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,13 +475,13 @@ class TestIndelTranslationRoundTrip:
         assert alt_cds == "ATGTGCAAA"
         assert _translate(alt_cds, "+") == "MCK"
 
-    def test_frameshift_deletion_gives_exclamation(self):
-        # Delete 2 bp (non-frame) → frameshift
+    def test_frameshift_deletion_gives_gt(self):
+        # Delete 1 bp from a 2-bp REF (non-frame) → frameshift → ">"
         ref_cds = "ATGGAATGCAAA"
         pi = [("103", _pi(3, "GA"))]
         alt_cds = _apply_variants(ref_cds, pi, {"103": "G"})   # del 1 bp from GA→G
         assert len(alt_cds) % 3 != 0
-        assert _translate(alt_cds, "+") == "!"
+        assert _translate(alt_cds, "+") == ">"
 
     def test_inframe_insertion_extends_protein(self):
         # Insert 3 bp in-frame after position 0 codon
